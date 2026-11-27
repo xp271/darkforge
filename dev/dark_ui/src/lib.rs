@@ -613,6 +613,7 @@ impl ImguiRenderLoop for App {
                 ui::Req::Preview(k) => api.preview(k),
                 ui::Req::Overlimit { cat, k, n } => api.overlimit(cat, k, n),
                 ui::Req::Affix { k, i } => api.affix(k, i),
+                ui::Req::Discard(k) => api.discard(k),
                 ui::Req::Seal { slot, fam } => api.seal(slot, fam),
                 ui::Req::Want(t) => api.want(&t),
             }

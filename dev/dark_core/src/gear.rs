@@ -285,12 +285,14 @@ impl Overlimit {
     }
 }
 
-/// 装备回收：给的道具（重铸石）、请求标记（回收 普通 / 稀有及以下 / 史诗及以下 / 传说及以下）、每把给几个（普通 / 稀有 / 史诗 / 传说）
+/// 装备回收：给的道具（重铸石）、请求标记（回收 普通 / 稀有及以下 / 史诗及以下 / 传说及以下）、每把给几个（普通 / 稀有 / 史诗 / 传说）、
+/// 回收全部弃置的请求标记（items.txt 的 recycle 行第 4 个数，0 = 没有这个功能；用户 2026-11-26）
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
 struct Recycle {
     goods: u32,
     flags: [u32; 4],
     stones: [u32; 4],
+    discard: u32,
 }
 
 /// 回购商店：商店行 row0 起 n 行；第 k 行的上架标记 rel0 + k、库存计数标记 stock0 + k（计数可能占到 STOCK_BITS 位，整段一起清）
@@ -774,7 +776,15 @@ fn parse_items(text: &str) -> Option<Items> {
             }
             ("wshop", 4..) => d.wshop.push((f[1].parse().ok()?, f[2].parse().ok()?, f[3].parse::<u8>().ok()?.min(4))),
             ("reforge", 4..) => d.reforge = Some(Reforge { goods: f[1].parse().ok()?, mark: f[2].parse().ok()?, fx: f[3].parse().ok()? }),
-            ("recycle", 4..) => d.recycle = Some(Recycle { goods: f[1].parse().ok()?, flags: arr(f[2])?, stones: arr(f[3])? }),
+            ("recycle", 4..) => {
+                d.recycle = Some(Recycle {
+                    goods: f[1].parse().ok()?,
+                    flags: arr(f[2])?,
+                    stones: arr(f[3])?,
+                    // 第 4 个数是「回收全部弃置」的请求标记（用户 2026-11-26）；旧 items.txt 没有这一栏 → 0 = 没有这个功能
+                    discard: f.get(4).and_then(|x| x.parse().ok()).unwrap_or(0),
+                })
+            }
             ("overlimit", 4..) => {
                 let steps: u32 = f[3].parse().ok()?;
                 let asteps = f.get(4).and_then(|x| x.parse().ok()).filter(|&x: &u32| x > 0).unwrap_or(steps);
@@ -3443,6 +3453,170 @@ fn locked_keys(text: &str, who: &(i32, String)) -> HashSet<(usize, u32)> {
         .collect()
 }
 
+// ------------------------------------------------------------------ 弃置名单（装备工坊「超限」页的「弃置」，用户 2026-11-26）
+/// 弃置名单：和锁定名单同目录同格式，一行「格子<TAB>0<TAB>编号<TAB>角色名」，只给生成武器用。
+/// 编号是 base（param_id / 10000 * 10000）：每把生成武器独占一条参数行，所以精确到单把，强化后也不变
+/// （强化等级是 pid - base，+1 步进）。锁定名单那边按「去掉末两位」记，对生成武器算出来同样是 base，这里直接用 base 更明确。
+/// 写入：dark_core（工坊的弃置按钮、回收后删、修剪）、dark_lock（在背包里锁定时删一条）；
+/// 读取：dark_core（快照、回收）、dark_sell（出售）。dark_sell 只读不写，避免两个 DLL 同时写同一份文件。
+const DISCARD_FILE: &str = "discard_items.txt";
+
+/// 名单全文（没有这个文件就是空的）
+fn discard_text() -> String {
+    fs::read_to_string(data_dir().join(DISCARD_FILE)).unwrap_or_default()
+}
+
+/// 名单里这个角色的 base 编号
+fn discard_keys(text: &str, who: &(i32, String)) -> HashSet<u32> {
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.trim_end_matches('\r').split('\t').collect();
+            (f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0)).then(|| f[2].parse::<u32>().ok()).flatten()
+        })
+        .collect()
+}
+
+/// 写名单（先写 .tmp 再换名：写到一半失败不会留下半个文件）；首行固定是说明
+fn discard_save(keep: &[String]) {
+    let p = data_dir().join(DISCARD_FILE);
+    let _ = fs::create_dir_all(data_dir());
+    let mut out = String::from("# 格子\t类别（0 武器）\t编号（生成武器的 base = 参数行 id / 10000 * 10000）\t角色名\n");
+    for l in keep {
+        out.push_str(l);
+        out.push('\n');
+    }
+    let tmp = p.with_extension("txt.tmp");
+    if fs::write(&tmp, out).and_then(|_| fs::rename(&tmp, &p)).is_err() {
+        log(&format!("弃置名单写不进 {}", p.display()));
+    }
+}
+
+/// 把这把武器标成弃置 / 取消弃置，返回改完以后是不是弃置。读-改-写、不做内存缓存
+/// （dark_lock 也可能改这份文件，有缓存就会把对方的改动写回去）
+fn discard_toggle(who: &(i32, String), base: u32) -> bool {
+    let mut keep: Vec<String> = Vec::new();
+    let mut had = false;
+    for l in discard_text().lines().map(|l| l.trim_end_matches('\r').to_string()) {
+        if l.trim().is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = l.split('\t').collect();
+        if f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0) && f[2].parse::<u32>().ok() == Some(base) {
+            had = true;
+            continue;
+        }
+        keep.push(l);
+    }
+    if !had {
+        keep.push(format!("{}\t0\t{base}\t{}", who.0, who.1));
+    }
+    discard_save(&keep);
+    !had
+}
+
+/// 从这个角色的弃置名单里删掉这些 base（回收 / 出售之后用）
+fn discard_remove(who: &(i32, String), bases: &[u32]) {
+    if bases.is_empty() {
+        return;
+    }
+    let (mut keep, mut hit) = (Vec::new(), 0);
+    for l in discard_text().lines().map(|l| l.trim_end_matches('\r').to_string()) {
+        if l.trim().is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = l.split('\t').collect();
+        let ours = f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0);
+        if ours && f[2].parse::<u32>().ok().is_some_and(|b| bases.contains(&b)) {
+            hit += 1;
+            continue;
+        }
+        keep.push(l);
+    }
+    if hit > 0 {
+        discard_save(&keep);
+    }
+}
+
+/// 把一份背包 / 木箱里的生成武器 base 收进 out（弃置名单的修剪判据用）
+fn weapon_bases(inv: &EquipInventoryData, out: &mut HashSet<u32>) {
+    for e in inv.items_data.normal_entries() {
+        let Some(it) = e.as_option() else { continue };
+        if it.item_id.category() as u8 == INV_CAT[0] && it.quantity > 0 {
+            out.insert(it.item_id.param_id() / 10000 * 10000);
+        }
+    }
+}
+
+/// 修剪：这个角色在名单里、但背包和木箱里都没有的 base 删掉（卖掉 / 丢掉 / 回收之后的幽灵条目），返回删了几条。
+/// 必须同时看木箱：玩家把弃置的武器放进木箱后背包里就没了，只看背包会把标记误删，取回来时状态就丢了
+fn discard_prune(pgd: &PlayerGameData, who: &(i32, String)) -> usize {
+    let text = discard_text();
+    if text.trim().is_empty() {
+        return 0;
+    }
+    let mut live: HashSet<u32> = HashSet::new();
+    weapon_bases(&pgd.equipment.equip_inventory_data, &mut live);
+    if let Some(s) = &pgd.storage {
+        weapon_bases(s, &mut live);
+    }
+    let (mut keep, mut gone) = (Vec::new(), 0);
+    for l in text.lines().map(|l| l.trim_end_matches('\r').to_string()) {
+        if l.trim().is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = l.split('\t').collect();
+        let ours = f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0);
+        if ours && f[2].parse::<u32>().ok().is_some_and(|b| !live.contains(&b)) {
+            gone += 1;
+            continue;
+        }
+        keep.push(l);
+    }
+    if gone > 0 {
+        discard_save(&keep);
+    }
+    gone
+}
+
+/// 弃置 / 取消弃置一把生成武器（装备工坊「超限」页武器栏的第 4 个按钮，用户 2026-11-26）：
+/// 只写名单、不动游戏数据（规则上只影响一键出售和武器回收）。装备着的、锁定的不能弃置
+fn discard_apply(d: &Defs, st: &St, pgd: &PlayerGameData, who: &(i32, String), k: u32) -> Result<[String; 2], [String; 2]> {
+    let e = |zh: &str, en: &str| [zh.to_string(), en.to_string()];
+    let Some(rec) = st.recs.get(&(0, k)) else {
+        return Err(e("这不是你的生成武器", "this is not your generated armament"));
+    };
+    let base = rec_id(&d.items, rec);
+    let (eq_ids, _) = equipped(pgd);
+    let inv = &pgd.equipment.equip_inventory_data;
+    let mut found = false;
+    for ent in inv.items_data.normal_entries() {
+        let Some(it) = ent.as_option() else { continue };
+        if it.item_id.category() as u8 != INV_CAT[0] || it.quantity == 0 || it.item_id.param_id() / 10000 * 10000 != base {
+            continue;
+        }
+        if eq_ids.contains(&it.item_id.into_inner()) {
+            return Err(e("装备着的武器不能弃置，先换下来", "an equipped armament can't be discarded; unequip it first"));
+        }
+        found = true;
+        break;
+    }
+    if !found {
+        return Err(e("这把武器不在背包里了", "the armament is no longer in your inventory"));
+    }
+    let locked = st.who.as_ref().map(|w| locked_keys(&rec_read(LOCK_FILE).unwrap_or_default(), w)).unwrap_or_default();
+    if locked.contains(&(0, base)) {
+        return Err(e("这把武器锁着，先解锁", "this armament is locked; unlock it first"));
+    }
+    let now = discard_toggle(who, base);
+    let names = [plain_name(d, rec, 0), plain_name(d, rec, 1)];
+    log(&format!("弃置：武器 {k}（{}）{}（{base}）", names[0], if now { "已弃置" } else { "已取消弃置" }));
+    Ok(if now {
+        [format!("「{}」已弃置", names[0]), format!("\"{}\" marked as discarded.", names[1])]
+    } else {
+        [format!("「{}」已取消弃置", names[0]), format!("\"{}\" is no longer marked as discarded.", names[1])]
+    })
+}
+
 /// 锁定名单变了以后要做的：(改回原价的 [(物品, 原价)], 改成 -1 的 [(物品, 现在的价)])。
 /// applied = 已经改成 -1 的（和原价）；want = 现在锁定的；cur = 参数行现在的出售价格（没有这一行就 None）。
 /// 锁定的物品价格不是 -1 就改（第一次锁、或者参数行被重建成按稀有度的价格了），本来就是 -1 的不动
@@ -4370,6 +4544,16 @@ fn confirm_tick(d: &Defs, st: &St, pgd: &PlayerGameData) {
     for i in 0..gift::MAX_PEERS {
         tx.push(gift::label(i));
     }
+    // 17（占位写 #IH）：回收全部弃置（「超限」页武器栏打了弃置标记的那些，用户 2026-11-26）
+    tx.resize(17, None);
+    if let Some(rc) = d.items.recycle.filter(|r| r.discard != 0) {
+        let (k, s) = recycle_discard_counts(d, st, pgd, &rc);
+        tx.push(Some(if k == 0 {
+            ("没有可被回收的弃置武器".to_string(), "No discarded armaments to recycle".to_string())
+        } else {
+            (format!("预计回收 {k} 把弃置武器，得到 {s} 个重铸石"), format!("{k} discarded armaments -> {s} reforge stones"))
+        }));
+    }
     let key = tx.iter().map(|x| x.as_ref().map_or_else(String::new, |(a, b)| format!("{a}|{b}"))).collect::<Vec<_>>().join("|");
     let mut g = TXT.lock().unwrap_or_else(|e| e.into_inner());
     let t = g.get_or_insert_with(Txt::default);
@@ -4516,6 +4700,65 @@ fn recycle_batch(d: &Defs, st: &mut St, pgd: &mut PlayerGameData, who: &(i32, St
         if sent { "已排队发" } else { "没发（没有发货表）" },
         if fail > 0 { format!("；{fail} 把没移掉（格子变了或移除失败）") } else { String::new() }
     ));
+}
+
+/// 回收全部弃置（用户 2026-11-26）：背包里（不含仓库）这个角色的生成武器、没装备着、没锁定、且在弃置名单里的，
+/// 逐把移除（和 recycle_batch 同一套：游戏自己的移除函数 + 删记录 + 借发货表发重铸石），成功后从弃置名单删掉
+fn recycle_discarded(d: &Defs, st: &mut St, pgd: &mut PlayerGameData, who: &(i32, String), rc: Recycle) {
+    let disc = discard_keys(&discard_text(), who);
+    let list: Vec<_> = recycle_list(d, st, pgd).into_iter().filter(|x| disc.contains(&((x.1 & 0x0FFF_FFFF) / 10000 * 10000))).collect();
+    if list.is_empty() {
+        log("装备回收（弃置）：没有能回收的弃置武器（背包里、没装备、没锁定的才算）");
+        return;
+    }
+    let Some(f) = remove_item_fn() else { return };
+    let Some(inv_ptr) = inventory(pgd) else {
+        log("装备回收（弃置）：背包结构地址对不上，没回收");
+        return;
+    };
+    let inv = unsafe { &mut *inv_ptr };
+    let key_cap = inv.items_data.key_items_capacity;
+    let remove = unsafe { std::mem::transmute::<usize, RemoveItemFn>(f) };
+    let here = |inv: &EquipInventoryData, idx: usize, raw: u32| inv.items_data.normal_entries()[idx].as_option().is_some_and(|it| it.item_id.into_inner() == raw);
+    let (mut n, mut stones, mut fail, mut done) = (0u32, 0u32, 0u32, Vec::new());
+    for (idx, raw, key, rar) in list {
+        if !here(inv, idx, raw) {
+            fail += 1;
+            continue;
+        }
+        unsafe { remove(inv_ptr, key_cap + idx as u32, 1) };
+        if here(inv, idx, raw) {
+            fail += 1;
+            continue;
+        }
+        st.recs.remove(&key);
+        done.push((raw & 0x0FFF_FFFF) / 10000 * 10000);
+        n += 1;
+        stones += rc.stones[rar.min(3)];
+    }
+    if n > 0 {
+        rec_save(who, st);
+    }
+    discard_remove(who, &done); // 回收掉的当场从名单删，不等下次修剪
+    let sent = stones == 0 || gift_n(1, rc.goods as i32, stones);
+    log(&format!(
+        "装备回收（弃置）：回收 {n} 把，重铸石 {stones} 个{}{}",
+        if sent { "已排队发" } else { "没发（没有发货表）" },
+        if fail > 0 { format!("；{fail} 把没移掉（格子变了或移除失败）") } else { String::new() }
+    ));
+}
+
+/// 确认框用：回收全部弃置能回收几把、得几个重铸石
+fn recycle_discard_counts(d: &Defs, st: &St, pgd: &PlayerGameData, rc: &Recycle) -> (u32, u32) {
+    let disc = st.who.as_ref().map(|w| discard_keys(&discard_text(), w)).unwrap_or_default();
+    let (mut n, mut s) = (0u32, 0u32);
+    for (_, raw, _, rar) in recycle_list(d, st, pgd) {
+        if disc.contains(&((raw & 0x0FFF_FFFF) / 10000 * 10000)) {
+            n += 1;
+            s += rc.stones[rar.min(3)];
+        }
+    }
+    (n, s)
 }
 
 // ------------------------------------------------------------------ 装备继承（装备工坊的「继承」页，用户 2026-10-31）
@@ -4930,12 +5173,24 @@ pub fn tick() {
         for &t in &lit {
             flag_set(rc.flags[t], false);
         }
-        match lit.as_slice() {
-            [] => {}
-            _ if st.frames < SETTLE_FRAMES => log("装备回收：进存档时回收请求亮着（存档里残留的），已熄灭、不回收"),
-            [t] if at_grace() => recycle_batch(d, st, pgd, &who, rc, *t),
-            [_] => log("装备回收：回收请求亮了，但人物不在赐福点，不回收"),
-            _ => log("装备回收：同时亮了不止一个回收请求，全部熄灭、不回收"),
+        // 回收全部弃置（用户 2026-11-26）：和 4 档一样算「一个请求」，同时亮就别动
+        let disc = rc.discard != 0 && flag_get(rc.discard) == Some(true);
+        if disc {
+            flag_set(rc.discard, false);
+        }
+        let n = lit.len() + disc as usize;
+        if n == 0 {
+            // 什么都没亮
+        } else if st.frames < SETTLE_FRAMES {
+            log("装备回收：进存档时回收请求亮着（存档里残留的），已熄灭、不回收");
+        } else if n > 1 {
+            log("装备回收：同时亮了不止一个回收请求，全部熄灭、不回收");
+        } else if !at_grace() {
+            log("装备回收：回收请求亮了，但人物不在赐福点，不回收");
+        } else if disc {
+            recycle_discarded(d, st, pgd, &who, rc);
+        } else {
+            recycle_batch(d, st, pgd, &who, rc, lit[0]);
         }
     }
     if st.frames % 30 == 0 {
@@ -6513,9 +6768,12 @@ mod tests {
         let head = "container\tw\t240000000\t10000\t3000\t664\t96:4\ncontainer\tp\t30000000\t100\t6000\t416\t\n\
              container\ta\t20000\t1\t600\t96\t\ntext\tN\t128\ntext\tI\t160\ntext\tC\t640\nlabel\tzh\tx\nlabel\ten\ty\ngoods\t0\t0\t8000\n\
              deliver\t10900\t32\t93501\nidentify\t93502\nlotlayout\t44\t0\t32\t40\t36\t28\n";
-        let it = parse_items(&format!("{head}reforge\t9240\t369180\t369181\nrecycle\t9240\t93087,93088,93089,93090\t1,2,3,4\n")).unwrap();
+        let it = parse_items(&format!("{head}reforge\t9240\t369180\t369181\nrecycle\t9240\t93087,93088,93089,93090\t1,2,3,4\t93091\n")).unwrap();
         assert_eq!(it.reforge, Some(Reforge { goods: 9240, mark: 369180, fx: 369181 }));
-        assert_eq!(it.recycle, Some(Recycle { goods: 9240, flags: [93087, 93088, 93089, 93090], stones: [1, 2, 3, 4] }));
+        assert_eq!(it.recycle, Some(Recycle { goods: 9240, flags: [93087, 93088, 93089, 93090], stones: [1, 2, 3, 4], discard: 93091 }));
+        // 旧 items.txt 没有第 4 个数（回收全部弃置是 2026-11-26 加的）：照旧解析，不等于没有这个功能
+        let it = parse_items(&format!("{head}recycle\t9240\t93087,93088,93089,93090\t1,2,3,4\n")).unwrap();
+        assert_eq!(it.recycle, Some(Recycle { goods: 9240, flags: [93087, 93088, 93089, 93090], stones: [1, 2, 3, 4], discard: 0 }));
         let it = parse_items(head).unwrap();
         assert_eq!((it.reforge, it.recycle), (None, None));
     }

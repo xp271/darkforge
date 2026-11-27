@@ -188,7 +188,7 @@ impl Workshop {
             }
             if wp.loaded {
                 d.icon(wp.icon, x + 12.0, ry + 6.0, 64.0, 1.0);
-                d.badges(x + 13.0, ry + 7.0, 20.0, wp.worn, wp.locked);
+                d.badges(x + 13.0, ry + 7.0, 20.0, 64.0, wp.worn, wp.locked, wp.discard);
                 d.text_clip(x + 92.0, ry + 10.0, w - 100.0, 24.0, RAR[wp.rar.min(3)], 1.0, &wp.name);
                 let sub = format!("{} · +{}", wtype_name(wp.wtype, l), wp.level);
                 d.text(x + 92.0, ry + 44.0, 19.0, DIM, 1.0, &sub);

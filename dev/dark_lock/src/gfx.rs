@@ -8,6 +8,8 @@
 
 const CELL_NAMES: [&str; 3] = ["ItemIcon", "inadequacy", "StockNum"];
 pub const LOCK_NAME: &str = "RngLock";
+/// 「弃置」的红叉：名字 RngDiscard，位置在格子正中，显示 / 隐藏由 DLL 按弃置名单控制
+pub const DISCARD_NAME: &str = "RngDiscard";
 /// DefineBitsLossless2 正文（不含编号）：格式 5 + 宽 + 高 + zlib(预乘 alpha 的 ARGB)
 const LOCK_BITMAP: &[u8] = include_bytes!("lock_bitmap.bin");
 /// 和 MENU_EquMark 一样按 0.56 倍显示（约 22x24 像素）
@@ -15,6 +17,17 @@ const LOCK_IMG_SCALE: f64 = 0.56;
 /// 锁图左上角在格子里的位置（twips，1/20 像素）：「装备中」标记占 (-874, -934)~(-426, -464)，锁放在它正下方
 const LOCK_X: i32 = -874;
 const LOCK_Y: i32 = -450;
+/// 「弃置」红叉（用户 2026-11-26 做的图，dark_ui 的工坊界面用的是同一张）：
+/// 和锁一样走「新建位图 + sprite」这条路（复用原版 inadequacy 定义试过，游戏里不显示——那个精灵由游戏自己控制）
+const DISCARD_BITMAP: &[u8] = include_bytes!("../../dark_ui/src/discard_bitmap.bin");
+/// 红叉和锁同一规格（40x42 画布、0.56 倍 ≈ 22x24 像素）
+const DISCARD_IMG_SCALE: f64 = 0.56;
+/// 红叉在格子里的位置：放**正中央**，对准物品图标本身。
+/// 不放右下角的原因（鱼塘主 2026-11-27）：各界面格子尺寸不一样（木箱的图标明显比背包小），
+/// 右下角 (540,540) 在木箱里会超出格子边缘；而格子中心在哪个界面都空着，一套坐标通吃。
+/// 下面是「让 40x42 画布正中对准格子原点」的偏移：40*0.56/2*20 = 224，42*0.56/2*20 = 235。
+const DISCARD_X: i32 = -224;
+const DISCARD_Y: i32 = -235;
 
 struct Tag {
     code: u16,
@@ -162,20 +175,27 @@ fn matrix_bytes(scale: f64, tx: i32, ty: i32) -> Vec<u8> {
     w.finish()
 }
 
-/// 跳过 MATRIX
-fn skip_matrix(b: &[u8], o: usize) -> Result<usize, String> {
+/// 读 MATRIX：((ScaleX, ScaleY), (TranslateX, TranslateY))（位移是 twips），顺带返回下一段的偏移。
+/// 旋转 / 斜切只跳过不解析（这几个界面文件里都是 0）
+fn read_matrix(b: &[u8], o: usize) -> Result<(((f64, f64), (i32, i32)), usize), String> {
     let mut r = BitReader { b, o, bit: 0 };
+    let mut sc = (1.0, 1.0);
     if r.ub(1)? == 1 {
         let n = r.ub(5)?;
-        r.ub(n * 2)?;
+        let (a, c) = (r.ub(n)?, r.ub(n)?);
+        let f = |v: u32| {
+            if n > 0 && (v >> (n - 1)) & 1 != 0 { (v as i64 - (1i64 << n)) as f64 / 65536.0 } else { v as f64 / 65536.0 }
+        };
+        sc = (f(a), f(c));
     }
     if r.ub(1)? == 1 {
         let n = r.ub(5)?;
         r.ub(n * 2)?;
     }
     let n = r.ub(5)?;
-    r.ub(n * 2)?;
-    Ok(r.align())
+    let (tx, ty) = (r.ub(n)?, r.ub(n)?);
+    let s = |v: u32| if n > 0 && (v >> (n - 1)) & 1 != 0 { (v as i64 - (1i64 << n)) as i32 } else { v as i32 };
+    Ok(((sc, (s(tx), s(ty))), r.align()))
 }
 
 fn skip_cxform_alpha(b: &[u8], o: usize) -> Result<usize, String> {
@@ -187,8 +207,8 @@ fn skip_cxform_alpha(b: &[u8], o: usize) -> Result<usize, String> {
     Ok(r.align())
 }
 
-/// PlaceObject2 / PlaceObject3 → （深度, 名字）
-fn place_info(code: u16, b: &[u8]) -> Result<(u16, Option<String>), String> {
+/// PlaceObject2 / PlaceObject3 → （深度, 元件编号, 矩阵, 名字）
+fn place_info(code: u16, b: &[u8]) -> Result<(u16, Option<u16>, Option<((f64, f64), (i32, i32))>, Option<String>), String> {
     let f = *b.first().ok_or("空 PlaceObject")?;
     let mut p = 1;
     let mut f2 = 0;
@@ -201,12 +221,20 @@ fn place_info(code: u16, b: &[u8]) -> Result<(u16, Option<String>), String> {
     if code == 70 && f2 & 0x08 != 0 {
         p += b[p..].iter().position(|&c| c == 0).ok_or("类名没结尾")? + 1;
     }
-    if f & 0x02 != 0 {
+    let char_id = if f & 0x02 != 0 {
+        let v = u16::from_le_bytes(b.get(p..p + 2).ok_or("PlaceObject 太短")?.try_into().unwrap());
         p += 2;
-    }
-    if f & 0x04 != 0 {
-        p = skip_matrix(b, p)?;
-    }
+        Some(v)
+    } else {
+        None
+    };
+    let mat = if f & 0x04 != 0 {
+        let (m, np) = read_matrix(b, p)?;
+        p = np;
+        Some(m)
+    } else {
+        None
+    };
     if f & 0x08 != 0 {
         p = skip_cxform_alpha(b, p)?;
     }
@@ -219,7 +247,7 @@ fn place_info(code: u16, b: &[u8]) -> Result<(u16, Option<String>), String> {
     } else {
         None
     };
-    Ok((depth, name))
+    Ok((depth, char_id, mat, name))
 }
 
 /// 位图填充的矩形：(0, 0)~(宽, 高) 像素，1 像素 = 20 twips
@@ -272,6 +300,42 @@ fn defined_ids(b: &[u8], tags: &[Tag]) -> Vec<u16> {
     ids
 }
 
+/// 往 defs 里加一套「位图 + 填充矩形 shape + 一帧 sprite」，返回 sprite 的编号。
+/// base_id 要空出 3 个连号（位图、shape、sprite）；scale 是 sprite 里 shape 的缩放
+fn add_bitmap_sprite(defs: &mut Vec<u8>, bitmap: &[u8], base_id: u16, scale: f64) -> Result<u16, String> {
+    if bitmap.len() < 5 {
+        return Err("位图数据不对".into());
+    }
+    let (bmp, shape, sid) = (base_id, base_id + 1, base_id + 2);
+    let (bw, bh) = (u16::from_le_bytes([bitmap[1], bitmap[2]]) as i32, u16::from_le_bytes([bitmap[3], bitmap[4]]) as i32);
+    let mut b36 = bmp.to_le_bytes().to_vec();
+    b36.extend_from_slice(bitmap);
+    defs.extend(tag(36, &b36));
+    defs.extend(bitmap_shape_tag(shape, bmp, bw, bh));
+    let mut po = vec![0x06u8]; // HasMatrix | HasCharacter
+    po.extend(1u16.to_le_bytes());
+    po.extend(shape.to_le_bytes());
+    po.extend(matrix_bytes(scale, 0, 0));
+    let mut sp = sid.to_le_bytes().to_vec();
+    sp.extend(1u16.to_le_bytes());
+    sp.extend(tag(26, &po));
+    sp.extend(tag(1, &[]));
+    sp.extend(tag(0, &[]));
+    defs.extend(tag(39, &sp));
+    Ok(sid)
+}
+
+/// 格子里的一个带名字的 PlaceObject2
+fn place_object(depth: u16, char_id: u16, tx: i32, ty: i32, name: &str) -> Vec<u8> {
+    let mut po = vec![0x26u8]; // HasName | HasMatrix | HasCharacter
+    po.extend(depth.to_le_bytes());
+    po.extend(char_id.to_le_bytes());
+    po.extend(matrix_bytes(1.0, tx, ty));
+    po.extend(name.as_bytes());
+    po.push(0);
+    po
+}
+
 /// 改写一个界面文件：认出格子元件就返回改好的字节
 pub fn patch(src: &[u8]) -> Result<Option<Vec<u8>>, String> {
     if src.len() < 21 || !(src.starts_with(b"GFX") || src.starts_with(b"FWS")) {
@@ -292,7 +356,7 @@ pub fn patch(src: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let mut first_frame = None;
         for k in &kids {
             if matches!(k.code, 26 | 70) {
-                let (d, n) = place_info(k.code, &src[k.body..k.end])?;
+                let (d, _cid, _mat, n) = place_info(k.code, &src[k.body..k.end])?;
                 max_depth = max_depth.max(d);
                 if first_frame.is_none() {
                     if let Some(n) = n {
@@ -303,7 +367,7 @@ pub fn patch(src: &[u8]) -> Result<Option<Vec<u8>>, String> {
                 first_frame = Some(k.start);
             }
         }
-        if names.iter().any(|n| n == LOCK_NAME) {
+        if names.iter().any(|n| n == LOCK_NAME || n == DISCARD_NAME) {
             return Ok(None); // 已经改过
         }
         if CELL_NAMES.iter().all(|c| names.iter().any(|n| n == c)) {
@@ -317,27 +381,13 @@ pub fn patch(src: &[u8]) -> Result<Option<Vec<u8>>, String> {
     }
     let ids = defined_ids(src, &tags);
     let next = ids.iter().copied().max().unwrap_or(0) as u32 + 1;
-    if next + 3 > 0xFFFF || LOCK_BITMAP.len() < 5 {
-        return Err("编号用完了 / 位图数据不对".into());
+    // 两套位图精灵，各占 3 个连号
+    if next + 6 > 0xFFFF {
+        return Err("编号用完了".into());
     }
-    let (bmp, shape, lock_id) = (next as u16, next as u16 + 1, next as u16 + 2);
-    let bw = u16::from_le_bytes([LOCK_BITMAP[1], LOCK_BITMAP[2]]) as i32;
-    let bh = u16::from_le_bytes([LOCK_BITMAP[3], LOCK_BITMAP[4]]) as i32;
     let mut defs = Vec::new();
-    let mut b36 = bmp.to_le_bytes().to_vec();
-    b36.extend_from_slice(LOCK_BITMAP);
-    defs.extend(tag(36, &b36));
-    defs.extend(bitmap_shape_tag(shape, bmp, bw, bh));
-    let mut po = vec![0x06u8]; // HasMatrix | HasCharacter
-    po.extend(1u16.to_le_bytes());
-    po.extend(shape.to_le_bytes());
-    po.extend(matrix_bytes(LOCK_IMG_SCALE, 0, 0));
-    let mut sp = lock_id.to_le_bytes().to_vec();
-    sp.extend(1u16.to_le_bytes());
-    sp.extend(tag(26, &po));
-    sp.extend(tag(1, &[]));
-    sp.extend(tag(0, &[]));
-    defs.extend(tag(39, &sp));
+    let lock_id = add_bitmap_sprite(&mut defs, LOCK_BITMAP, next as u16, LOCK_IMG_SCALE)?;
+    let disc_id = add_bitmap_sprite(&mut defs, DISCARD_BITMAP, next as u16 + 3, DISCARD_IMG_SCALE)?;
 
     // 重新拼：在第一个格子元件前插定义；每个格子元件第一帧前插 PlaceObject2
     let mut out = src[..hdr].to_vec();
@@ -348,14 +398,9 @@ pub fn patch(src: &[u8]) -> Result<Option<Vec<u8>>, String> {
         if n == 0 {
             out.extend_from_slice(&defs);
         }
-        let mut po = vec![0x26u8]; // HasName | HasMatrix | HasCharacter
-        po.extend((max_depth + 1).to_le_bytes());
-        po.extend(lock_id.to_le_bytes());
-        po.extend(matrix_bytes(1.0, LOCK_X, LOCK_Y));
-        po.extend(LOCK_NAME.as_bytes());
-        po.push(0);
         let mut body = src[t.body..ff].to_vec();
-        body.extend(tag(26, &po));
+        body.extend(tag(26, &place_object(max_depth + 1, lock_id, LOCK_X, LOCK_Y, LOCK_NAME)));
+        body.extend(tag(26, &place_object(max_depth + 2, disc_id, DISCARD_X, DISCARD_Y, DISCARD_NAME)));
         body.extend_from_slice(&src[ff..t.end]);
         let mut hdr39 = Vec::new();
         hdr39.extend(((39u16 << 6) | 0x3F).to_le_bytes());
@@ -466,6 +511,51 @@ mod tests {
             }
             assert_eq!(changed, want);
         }
+    }
+
+    /// 弃置红叉：和锁同一套位图精灵，只是位图不同、位置在格子正中
+    #[test]
+    fn patch_adds_discard() {
+        // 用仓库里带的背包格子样本（box.gfx，只带 RngLock 的旧产物）；下面先把 RngLock 改名当"没改过"
+        let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("box.gfx");
+        let Ok(mut b) = std::fs::read(&p) else {
+            println!("没有样本 {}，跳过", p.display());
+            return;
+        };
+        for i in 0..b.len().saturating_sub(7) {
+            if &b[i..i + 7] == b"RngLock" {
+                b[i] = b'X';
+            }
+        }
+        let out = super::patch(&b).unwrap().expect("没认出格子元件");
+        assert!(super::patch(&out).unwrap().is_none(), "二次改写应该不动");
+        let hdr = 8 + (5 + (out[8] >> 3) as usize * 4).div_ceil(8) + 4;
+        let tags = super::read_tags(&out, hdr, out.len()).unwrap();
+        let mut found = None;
+        let mut lock_cid = None;
+        for t in &tags {
+            if t.code != 39 {
+                continue;
+            }
+            for k in super::read_tags(&out, t.body + 4, t.end).unwrap() {
+                if k.code != 26 {
+                    continue;
+                }
+                let (d, cid, mat, n) = super::place_info(k.code, &out[k.body..k.end]).unwrap();
+                match n.as_deref() {
+                    Some(super::DISCARD_NAME) => found = Some((d, cid, mat)),
+                    Some(super::LOCK_NAME) => lock_cid = cid,
+                    _ => {}
+                }
+            }
+        }
+        let (d, cid, mat) = found.expect("没插入 RngDiscard");
+        let ((sx, sy), (tx, ty)) = mat.expect("RngDiscard 没有矩阵");
+        assert!(d > 1, "深度要在锁后面");
+        assert_ne!(cid, lock_cid, "弃置红叉要用自己那套位图，不能和锁共用一个精灵");
+        assert!((sx - 1.0).abs() < 1e-6 && (sy - 1.0).abs() < 1e-6, "缩放放在 sprite 里，PlaceObject 是 1.0");
+        // 正中央：红叉画布 40x42、显示 0.56 倍 → 偏移 -224 / -235 twips，让画布中心落在格子原点
+        assert_eq!((tx, ty), (-224, -235), "位置要在格子正中央（各界面格子尺寸不同，右下角会在木箱里越界）");
     }
 
     #[test]

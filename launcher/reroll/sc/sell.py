@@ -14,6 +14,9 @@ from .esdutil import ALWAYS, DIALOG_WAIT, MENU_WAIT, flag_is_on, register, i32, 
 OPTION, TEXT, CAT_TEXT, DONE_TEXT, MISSING_TEXT = 34, 80090110, 80090111, 80090115, 80090116
 TIER_TEXT, DESC_TEXT = 80090117, 80090121          # 档位名 4 个、背包的确认框 12 个（类别 × 4 + 档位）
 CHEST_CAT_TEXT, CHEST_DESC_TEXT = 80090500, 80090510   # 木箱的类别 3 个、确认框 12 个（80090500 段没人用，2026-11-25）
+# 「出售全部弃置」（用户 2026-11-26）：类别列表的第 7 项，选了直接进确认框（没有档位），标记单独一个 93019
+# （93019 原为圆顶请求、已停用，dev\event_flags\说明.md 明确可再分配；最初用 93012 和许愿石撞了）
+DISCARD_CAT_TEXT, DISCARD_DESC_TEXT, DISCARD_FLAG = 80090130, 80090131, 93019
 # 和 dark_sell 的 SELL_FLAGS 一致：背包 3 类 × 4 档，再木箱 3 类 × 4 档
 FLAGS = tuple(range(93000, 93012)) + tuple(range(92780, 92792))
 KINDS = (('武器', 'weapons'), ('防具', 'armor'), ('护符', 'talismans'))
@@ -55,14 +58,18 @@ def esd(cx, groups):
     p = menu_parts(groups, cx.root)
     add_cmd, conf_call, yes_eval, no_eval, ret, gid = (p[k] for k in ('add_cmd', 'conf_call', 'yes_eval', 'no_eval', 'ret', 'gid'))
     nc, nt = len(CATS), len(TIERS)
+    ncat = nc + 1                      # 第 7 项「出售全部弃置」（没档位，直接确认框）
+    disc_i = nc * nt                   # 它在确认框 / 标记状态里的序号（24）
+    cat_label = lambda c: DISCARD_CAT_TEXT if c == nc else cat_text(c)
     back = dict(add_cmd, args=[i32(99), i32(26000004), i32(-1)])
     show = {'bank': 1, 'id': 10, 'args': [i32(1)]}
     clear = [{'bank': 1, 'id': 12, 'args': []}, {'bank': 1, 'id': 20, 'args': []}]
     # 0 / 1：类别列表；100 + c / 110 + c：这一类的档位列表；200 + i：确认框；300 + i：点亮标记、弹提示；400 + i：看 DLL 有没有处理；500 + i：没处理
-    st = {0: {'entry': clear + [dict(add_cmd, args=[i32(c + 1), i32(cat_text(c)), i32(-1)]) for c in range(nc)] + [back, show],
+    st = {0: {'entry': clear + [dict(add_cmd, args=[i32(c + 1), i32(cat_label(c)), i32(-1)]) for c in range(ncat)] + [back, show],
               'conds': [{'target': 1, 'eval': MENU_WAIT, 'pass': [], 'sub': []}], 'exit': [], 'while': []},
           1: {'entry': [], 'exit': [], 'while': [],
               'conds': [{'target': 100 + c, 'eval': menu_pick(c + 1), 'pass': [], 'sub': []} for c in range(nc)]
+              + [{'target': 200 + disc_i, 'eval': menu_pick(ncat), 'pass': [], 'sub': []}]
               + [{'target': 9, 'eval': ALWAYS, 'pass': [], 'sub': []}]},
           9: {'entry': [], 'exit': [], 'while': [], 'conds': [ret]}}
     for c in range(nc):
@@ -86,6 +93,20 @@ def esd(cx, groups):
             st[500 + i] = {'entry': [{'bank': 1, 'id': 11, 'args': [i32(flag), i32(0)]},
                                      {'bank': 1, 'id': 17, 'args': [i32(7), i32(MISSING_TEXT), i32(1), i32(0), i32(1)]}],
                            'conds': [{'target': 9, 'eval': DIALOG_WAIT, 'pass': [], 'sub': []}], 'exit': [], 'while': []}
+    # 第 7 项「出售全部弃置」：确认框 → 点亮 DISCARD_FLAG → 看 DLL 处没处理（dark_sell 的 SELL_DISCARD_FLAG）
+    i, flag = disc_i, DISCARD_FLAG
+    st[200 + i] = {'entry': [dict(conf_call, args=[i32(DISCARD_DESC_TEXT)])], 'exit': [], 'while': [],
+                   'conds': [{'target': 300 + i, 'eval': yes_eval, 'pass': [], 'sub': []},
+                             {'target': 0, 'eval': no_eval, 'pass': [], 'sub': []}]}
+    st[300 + i] = {'entry': [{'bank': 1, 'id': 11, 'args': [i32(flag), i32(1)]},
+                             {'bank': 1, 'id': 17, 'args': [i32(7), i32(DONE_TEXT), i32(1), i32(0), i32(1)]}],
+                   'conds': [{'target': 400 + i, 'eval': DIALOG_WAIT, 'pass': [], 'sub': []}], 'exit': [], 'while': []}
+    st[400 + i] = {'entry': [], 'exit': [], 'while': [],
+                   'conds': [{'target': 500 + i, 'eval': flag_is_on(flag), 'pass': [], 'sub': []},
+                             {'target': 0, 'eval': ALWAYS, 'pass': [], 'sub': []}]}
+    st[500 + i] = {'entry': [{'bank': 1, 'id': 11, 'args': [i32(flag), i32(0)]},
+                             {'bank': 1, 'id': 17, 'args': [i32(7), i32(MISSING_TEXT), i32(1), i32(0), i32(1)]}],
+                   'conds': [{'target': 9, 'eval': DIALOG_WAIT, 'pass': [], 'sub': []}], 'exit': [], 'while': []}
     groups[gid] = st
     register(cx, 'sell', TEXT, gid)          # 收进赐福最上面的「暗黑重铸」（sc/forge.py）
 
@@ -120,4 +141,14 @@ def texts(cx, key):
                 text = ('Sell all %s %s in your inventory for runes\n(equipped, locked and chest items are kept).\n%s\n\nSell them?'
                         % (TIERS_EN[t], cen, field(i, 'en')))
             out[desc_text(i)] = text
+    # 第 7 项「出售全部弃置」：类别名 + 确认框（占位序号 24 = #SO，dark_sell 的 write_fields 第 25 项）
+    out[DISCARD_CAT_TEXT] = '出售全部弃置' if key == 'zh' else 'Sell all discarded'
+    if key == 'zh':
+        out[DISCARD_DESC_TEXT] = ('出售背包里所有打了「弃置」标记的装备，按售价换成卢恩\n'
+                                  '（装备着的、锁定的、木箱里的不卖）。\n%s\n\n确定出售吗？'
+                                  % field(len(CATS) * len(TIERS), 'zh'))
+    else:
+        out[DISCARD_DESC_TEXT] = ('Sell all gear marked as discarded in your inventory for runes\n'
+                                  '(equipped, locked and chest items are kept).\n%s\n\nSell them?'
+                                  % field(len(CATS) * len(TIERS), 'en'))
     return {'EventTextForTalk': out}

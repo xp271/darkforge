@@ -8,8 +8,9 @@ use hudhook::windows::core::s;
 /// 4 = 加「超限」页（dr_ws_overlimit，快照 ostones / wovl / wocap / aovl / acut）；5 = 加「魇印」页（dr_ws_seal、快照 nm*、提示 get(3)）；
 /// 6 = 加「七咒」页（快照 cur）；7 = 「魇印」「七咒」各自从赐福「暗黑重铸」一项打开（dr_ws_state 第 1~2 位 = 入口）；
 /// 8 = 去掉提示 get(3)（改成原版闪烁提示，dark_core 的 notes.rs）；9 = 「超限」页防具词条升级（dr_ws_affix、快照 aup）；
-/// 12 = 快照只有索引，明细按需要来（dr_ws_want、get(3)）；13 = 索引带获得顺序和词条键，want 加 s（搜索文字）
-pub const API: u32 = 13;
+/// 12 = 快照只有索引，明细按需要来（dr_ws_want、get(3)）；13 = 索引带获得顺序和词条键，want 加 s（搜索文字）；
+/// 14 = 「超限」页武器栏的弃置按钮（dr_ws_discard，快照 w 行末尾多一列弃置 0|1）
+pub const API: u32 = 14;
 
 #[derive(Clone, Copy)]
 pub struct Api {
@@ -22,6 +23,7 @@ pub struct Api {
     overlimit: unsafe extern "C" fn(u32, u32, u32),
     seal: unsafe extern "C" fn(u32, i32),
     affix: unsafe extern "C" fn(u32, u32),
+    discard: unsafe extern "C" fn(u32),
     get: unsafe extern "C" fn(u32, *mut u8, usize) -> i64,
     want: unsafe extern "C" fn(*const u8, usize),
 }
@@ -41,6 +43,7 @@ impl Api {
                 overlimit: std::mem::transmute(GetProcAddress(m, s!("dr_ws_overlimit"))?),
                 seal: std::mem::transmute(GetProcAddress(m, s!("dr_ws_seal"))?),
                 affix: std::mem::transmute(GetProcAddress(m, s!("dr_ws_affix"))?),
+                discard: std::mem::transmute(GetProcAddress(m, s!("dr_ws_discard"))?),
                 get: std::mem::transmute(GetProcAddress(m, s!("dr_ws_get"))?),
                 want: std::mem::transmute(GetProcAddress(m, s!("dr_ws_want"))?),
             })
@@ -50,7 +53,7 @@ impl Api {
     /// 找不到时说明缺了什么（日志用）
     pub fn missing() -> String {
         let Ok(m) = (unsafe { GetModuleHandleA(s!("dark_core.dll")) }) else { return "dark_core.dll 没加载".into() };
-        let names = [s!("dr_ws_state"), s!("dr_ws_close"), s!("dr_ws_refresh"), s!("dr_ws_apply"), s!("dr_ws_reforge"), s!("dr_ws_preview"), s!("dr_ws_overlimit"), s!("dr_ws_seal"), s!("dr_ws_affix"), s!("dr_ws_get"), s!("dr_ws_want")];
+        let names = [s!("dr_ws_state"), s!("dr_ws_close"), s!("dr_ws_refresh"), s!("dr_ws_apply"), s!("dr_ws_reforge"), s!("dr_ws_preview"), s!("dr_ws_overlimit"), s!("dr_ws_seal"), s!("dr_ws_affix"), s!("dr_ws_discard"), s!("dr_ws_get"), s!("dr_ws_want")];
         let miss: Vec<String> = names
             .iter()
             .filter(|n| unsafe { GetProcAddress(m, **n) }.is_none())
@@ -92,6 +95,11 @@ impl Api {
     /// 防具词条升级：配方序号 k 的第 i 条升一档
     pub fn affix(&self, k: u32, i: usize) {
         unsafe { (self.affix)(k, i as u32) }
+    }
+
+    /// 弃置 / 取消弃置一把生成武器（配方序号）
+    pub fn discard(&self, k: u32) {
+        unsafe { (self.discard)(k) }
     }
 
     /// 魇印：把第 fam 种刻进第 slot 位（None = 取下）
@@ -170,6 +178,8 @@ pub struct Wpn {
     pub icon: u16,
     pub worn: bool,
     pub locked: bool,
+    /// 被玩家标了弃置（「超限」页武器栏的第 4 个按钮；只影响一键出售和武器回收）
+    pub discard: bool,
     pub level: u32,
     pub wtype: u16,
     pub name: String,
@@ -455,7 +465,7 @@ impl Snap {
                 "w" if f.len() >= 9 => {
                     d.lazy = true;
                     d.wpos.insert(n(1) as u32, d.weapons.len());
-                    d.weapons.push(Wpn { idx: n(1) as u32, rar: n(2).clamp(0, 3) as usize, worn: n(3) == 1, locked: n(4) == 1, wtype: n(5).clamp(0, u16::MAX as i64) as u16, ovl_able: n(6) == 1, sort: n(7).max(0) as u32, spec: keys(8).pop().unwrap_or_default(), ..Wpn::default() });
+                    d.weapons.push(Wpn { idx: n(1) as u32, rar: n(2).clamp(0, 3) as usize, worn: n(3) == 1, locked: n(4) == 1, wtype: n(5).clamp(0, u16::MAX as i64) as u16, ovl_able: n(6) == 1, sort: n(7).max(0) as u32, spec: keys(8).pop().unwrap_or_default(), discard: f.get(9).is_some_and(|x| *x == "1"), ..Wpn::default() });
                 }
                 "sa" if f.len() >= 3 => _ = d.search.insert((0, n(1) as u32), s(2).to_lowercase()),
                 "sw" if f.len() >= 3 => _ = d.search.insert((1, n(1) as u32), s(2).to_lowercase()),
@@ -511,8 +521,9 @@ impl Snap {
                     };
                     match d.wpos.get(&idx).copied() {
                         Some(i) => {
-                            let (ovl_able, sort, spec) = (d.weapons[i].ovl_able, d.weapons[i].sort, d.weapons[i].spec.clone());
-                            d.weapons[i] = Wpn { ovl_able, sort, spec, ..w };
+                            // discard 只在索引行里（w 行第 9 列），明细 wpn 行没有这一列，覆盖时要留住
+                            let (ovl_able, sort, spec, discard) = (d.weapons[i].ovl_able, d.weapons[i].sort, d.weapons[i].spec.clone(), d.weapons[i].discard);
+                            d.weapons[i] = Wpn { ovl_able, sort, spec, discard, ..w };
                         }
                         None if !d.lazy => {
                             d.wpos.insert(idx, d.weapons.len());
@@ -613,5 +624,27 @@ impl Snap {
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 索引行（w 行第 9 列 = 弃置）先来、明细行（wpn，没有弃置列）后到，
+    /// 覆盖时不能把弃置标记抹掉——2026-11-26 实测红叉一个都不显示就是这个原因
+    #[test]
+    fn discard_survives_detail_row() {
+        let s = Snap::parse("w\t1\t3\t0\t0\t0\t1\t5\t-\t1\nwpn\t1\t3\t120\t0\t0\t0\t0\t测试剑\n");
+        assert!(s.weapons[0].loaded, "明细行应该覆盖进来了");
+        assert!(s.weapons[0].discard, "明细行覆盖时把索引行的弃置标记丢了");
+        assert_eq!(s.weapons[0].name, "测试剑");
+    }
+
+    /// 老格式（没有第 9 列）也要能读，按未弃置算
+    #[test]
+    fn discard_absent_means_false() {
+        let s = Snap::parse("w\t1\t3\t0\t0\t0\t1\t5\t-\n");
+        assert!(!s.weapons[0].discard);
     }
 }

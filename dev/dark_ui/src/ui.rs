@@ -65,6 +65,8 @@ pub enum Req {
     Preview(u32),
     /// 超限：cat 0 武器 / 1 防具、配方序号、用几颗
     Overlimit { cat: u32, k: u32, n: u32 },
+    /// 弃置 / 取消弃置一把生成武器（「超限」页武器栏第 4 个按钮，配方序号）
+    Discard(u32),
     /// 魇印：把第 fam 种刻进第 slot 位（None = 取下）
     Seal { slot: usize, fam: Option<usize> },
     /// 防具词条升级：配方序号 k 的第 i 条
@@ -1443,7 +1445,7 @@ impl Workshop {
                 }
                 Cell::Tgt { p, .. } => {
                     d.icon(p.icon, cx + 4.0, cy + 4.0, cs - 8.0, a);
-                    d.badges(cx + 6.0, cy + 6.0, 26.0, p.worn, p.locked);
+                    d.badges(cx + 6.0, cy + 6.0, 26.0, cs - 8.0, p.worn, p.locked, false);
                 }
             }
             if i == self.sel[2] {
@@ -1880,13 +1882,18 @@ impl Draw<'_> {
     }
 
     /// 物品格子左上角的标记：「装备中」（原版 MENU_EquMark）、下面是锁定（dark_lock 背包里那个锁）；h = 标记高度
-    fn badges(&mut self, x: f32, y: f32, h: f32, worn: bool, locked: bool) {
+    /// 物品图标上的小标记：装备中（左上）、锁定（右上 / 装备中时下移一格）、弃置的红叉（右下角，用户 2026-11-26）
+    /// icon = 物品图标的边长（红叉要贴到图标右下角，位置跟原版「属性不足」区分开）
+    fn badges(&mut self, x: f32, y: f32, h: f32, icon: f32, worn: bool, locked: bool, discard: bool) {
         let w = h * 40.0 / 42.0;
         if worn {
             self.sprite("MENU_EquMark", x, y, w, h, 1.0);
         }
         if locked {
             self.sprite("DR_Lock", x, if worn { y + h } else { y }, w, h, 1.0);
+        }
+        if discard {
+            self.sprite("DR_Discard", x + icon - w - 1.0, y + icon - h - 1.0, w, h, 1.0);
         }
     }
 

@@ -58,8 +58,9 @@ use super::*;
 /// 4 = 加「超限」页（dr_ws_overlimit、快照 ostones / wovl / wocap / aovl / acut）；5 = 加「魇印」页（dr_ws_seal、快照 nm*、提示 dr_ws_get(3)）；
 /// 6 = 加「七咒」页（快照 cur）；7 = 「魇印」「七咒」各自从赐福打开（dr_ws_state 第 1~2 位 = 入口）；
 /// 8 = 去掉提示 dr_ws_get(3)（改成原版闪烁提示，notes.rs）；9 = 「超限」页防具词条升级（dr_ws_affix、快照 aup）；
-/// 12 = 快照只有索引，明细按需要来（dr_ws_want、dr_ws_get(3)）；13 = 索引带获得顺序和词条键，want 加 s（搜索文字）
-const API: u32 = 13;
+/// 12 = 快照只有索引，明细按需要来（dr_ws_want、dr_ws_get(3)）；13 = 索引带获得顺序和词条键，want 加 s（搜索文字）；
+/// 14 = 「超限」页武器栏的弃置按钮（dr_ws_discard，快照 w 行末尾多一列弃置 0|1）
+const API: u32 = 14;
 /// 搜索用的文字一帧算几件（第一次搜索时才算，分几帧算完不卡）
 const SEARCH_PER_TICK: usize = 32;
 /// 重铸范围预览抽几次
@@ -89,6 +90,8 @@ struct Ws {
     aup: Option<(u32, usize)>,
     /// 刻印请求：(刻印位, 第几种，None = 取下)
     seal: Option<(usize, Option<usize>)>,
+    /// 弃置请求：武器的配方序号（有就切换，见 gear.rs 的 discard_apply）
+    discard: Option<u32>,
     result: (u32, String),
     /// 要算重铸范围的武器、算好的 (版本, 文字)
     want_preview: Option<u32>,
@@ -153,6 +156,12 @@ pub extern "C" fn dr_ws_overlimit(cat: u32, k: u32, n: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn dr_ws_affix(k: u32, i: u32) {
     with(|w| w.aup = Some((k, i as usize)))
+}
+
+/// 弃置 / 取消弃置一把生成武器：k = 配方序号（快照 w 行的第一个数）。只写弃置名单，不动游戏数据
+#[unsafe(no_mangle)]
+pub extern "C" fn dr_ws_discard(k: u32) {
+    with(|w| w.discard = Some(k))
 }
 
 /// 刻印请求：slot = 刻印位，fam = 第几种（< 0 = 取下）
@@ -237,6 +246,7 @@ pub(super) fn tick(d: &Defs, st: &mut St, pgd: &mut PlayerGameData, who: &(i32, 
                     w.ovl = None;
                     w.aup = None;
                     w.seal = None;
+                    w.discard = None;
                 });
                 flag_set(ih.ack, true);
                 log(&format!("{}：打开", NAMES[want]));
@@ -259,13 +269,14 @@ pub(super) fn tick(d: &Defs, st: &mut St, pgd: &mut PlayerGameData, who: &(i32, 
             w.ovl = None;
             w.aup = None;
             w.seal = None;
+            w.discard = None;
         });
         flag_set(opens[mode], false);
         flag_set(ih.ack, false);
         log(&format!("{}：关闭{}", NAMES[mode], if close { "" } else if !alive { "（界面 3 秒没来问）" } else { "（菜单那边关了）" }));
         return;
     }
-    let (req, reforge, ovl, aup, seal) = with(|w| (w.req.take(), w.reforge.take(), w.ovl.take(), w.aup.take(), w.seal.take()));
+    let (req, reforge, ovl, aup, seal, disc) = with(|w| (w.req.take(), w.reforge.take(), w.ovl.take(), w.aup.take(), w.seal.take(), w.discard.take()));
     if let Some((slot, fam)) = seal {
         // 刻印不改装备，不要求坐在赐福点
         let res = crate::nightmare::set_slot(slot, fam);
@@ -274,6 +285,36 @@ pub(super) fn tick(d: &Defs, st: &mut St, pgd: &mut PlayerGameData, who: &(i32, 
             Ok(m) => format!("ok\t{}", m[lang]),
             Err(m) => format!("err\t{}", m[lang]),
         };
+        with(|w| {
+            w.result = (w.result.0 + 1, text);
+            w.want_snap = true;
+        });
+    }
+    if let Some(k) = disc {
+        // 弃置只写名单、不动游戏数据；工坊只能从赐福打开，at_grace 当第二道防线
+        let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if !at_grace() {
+                Err(["人物不在赐福点".to_string(), "You are not resting at a site of grace.".to_string()])
+            } else {
+                discard_apply(d, st, pgd, who, k)
+            }
+        }));
+        let res = run.unwrap_or_else(|_| {
+            log("弃置：执行时出错（详情见上一行 panic），名单可能没改");
+            Err([
+                "出错了，这次没有做完。关掉再打开看看".to_string(),
+                "Something went wrong and this was not finished. Reopen to see the current state.".to_string(),
+            ])
+        });
+        let lang = ui_lang();
+        let text = match &res {
+            Ok(m) => format!("ok\t{}", m[lang]),
+            Err(m) => format!("err\t{}", m[lang]),
+        };
+        if res.is_ok() {
+            crate::clash::workshop_sound();
+        }
+        log(&format!("装备工坊：{}", text.replace('\t', " ")));
         with(|w| {
             w.result = (w.result.0 + 1, text);
             w.want_snap = true;
@@ -328,6 +369,12 @@ pub(super) fn tick(d: &Defs, st: &mut St, pgd: &mut PlayerGameData, who: &(i32, 
         });
     }
     if with(|w| std::mem::take(&mut w.want_snap)) {
+        // 顺便修剪弃置名单（用户 2026-11-26）：卖掉 / 丢掉 / 回收掉的武器留着条目会变成幽灵，
+        // 按「背包和木箱里都没有了」才算真没了（只看背包会把放进木箱的武器误删，取回来时状态就丢了）
+        let pruned = discard_prune(pgd, who);
+        if pruned > 0 {
+            log(&format!("弃置名单：清掉 {pruned} 条（背包和木箱里都没有了）"));
+        }
         let (s, armor, weapons) = snapshot(d, st, pgd, mode as u32);
         with(|w| {
             w.snap = (w.snap.0 + 1, s);
@@ -372,6 +419,8 @@ struct WRow {
     rar: usize,
     worn: bool,
     locked: bool,
+    /// 被玩家标了弃置（「超限」页武器栏的第 4 个按钮；只影响一键出售和武器回收）
+    discard: bool,
     wtype: u16,
     /// 有超限数据（超限页列得出来）
     ovl: bool,
@@ -385,6 +434,7 @@ fn weapon_index(d: &Defs, st: &St, pgd: &PlayerGameData, repo: &Option<&mut Solo
     let (_, eq_idx) = equipped(pgd);
     let key_cap = pgd.equipment.equip_inventory_data.items_data.key_items_capacity;
     let locked = st.who.as_ref().map(|w| locked_keys(&rec_read(LOCK_FILE).unwrap_or_default(), w)).unwrap_or_default();
+    let disc = st.who.as_ref().map(|w| discard_keys(&discard_text(), w)).unwrap_or_default();
     let mut list: Vec<(u32, usize, u32, usize)> = inv_weapons(d, st, pgd).into_iter().map(|(k, slot, pid)| (k, slot, pid, st.recs[&(0, k)].rar())).collect();
     list.sort_by_key(|x| (std::cmp::Reverse(x.3), x.0));
     let mut out = Vec::with_capacity(list.len());
@@ -399,7 +449,7 @@ fn weapon_index(d: &Defs, st: &St, pgd: &PlayerGameData, repo: &Option<&mut Solo
             Recipe::W { spec, .. } => d.lib.wspec.iter().find(|x| x.sp == *spec).map_or("-".to_string(), |x| x.key.clone()),
             _ => "-".to_string(),
         };
-        out.push(WRow { k, pid, rar, worn: eq_idx.contains(&(key_cap + slot as u32)), locked: locked.contains(&(0, pid / 100 * 100)), wtype: w.wep_type() as u16, ovl, sort, spec });
+        out.push(WRow { k, pid, rar, worn: eq_idx.contains(&(key_cap + slot as u32)), locked: locked.contains(&(0, pid / 100 * 100)), discard: disc.contains(&base), wtype: w.wep_type() as u16, ovl, sort, spec });
     }
     out
 }
@@ -797,7 +847,7 @@ fn snapshot(d: &Defs, st: &St, pgd: &PlayerGameData, mode: u32) -> (String, Vec<
         out.push_str(&format!("pst\t{}\n", stats.map(|s| s.to_string()).join("\t")));
         weapons = weapon_index(d, st, pgd, &repo);
         for r in &weapons {
-            out.push_str(&format!("w\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", r.k, r.rar, r.worn as u8, r.locked as u8, r.wtype, r.ovl as u8, r.sort, r.spec));
+            out.push_str(&format!("w\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n", r.k, r.rar, r.worn as u8, r.locked as u8, r.wtype, r.ovl as u8, r.sort, r.spec, r.discard as u8));
         }
         armor = ih_armor(d, st, pgd);
         armor.retain(|a| st.recs.contains_key(&(1, a.idx)));

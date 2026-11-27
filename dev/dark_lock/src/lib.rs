@@ -380,6 +380,39 @@ fn save_locked(map: &HashMap<Key, String>) {
     }
 }
 
+/// 把这个格子的这把武器从弃置名单删掉（锁定即取消弃置，用户 2026-11-26），返回删了没有。
+/// 弃置名单是 dark_core 的（装备工坊「超限」页武器栏第 4 个按钮写的），和 lock_items.txt 同一个目录
+/// （联机时 角色记录\联机\）。两边都在游戏线程里跑，而且每次都现读现改、不缓存，不会真并发
+fn drop_discard(slot: i32, base: u32) -> bool {
+    let p = lock_file().with_file_name("discard_items.txt");
+    let Ok(text) = fs::read_to_string(&p) else { return false };
+    let mut out = String::from("# 格子\t类别（0 武器）\t编号（生成武器的 base = 参数行 id / 10000 * 10000）\t角色名\n");
+    let mut hit = false;
+    for l in text.lines().map(|l| l.trim_end_matches('\r')) {
+        if l.trim().is_empty() || l.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = l.split('\t').collect();
+        if f.len() >= 3 && f[0].parse::<i32>().ok() == Some(slot) && f[2].parse::<u32>().ok() == Some(base) {
+            hit = true;
+            continue;
+        }
+        out.push_str(l);
+        out.push('\n');
+    }
+    if !hit {
+        return false;
+    }
+    // 内存里那份弃置名单立刻作废，格子下次刷新就别再画红叉了（缓存 500 毫秒，玩家以为没生效）
+    *DISCARDED.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    let tmp = p.with_extension("txt.tmp");
+    if fs::write(&tmp, out).and_then(|_| fs::rename(&tmp, &p)).is_err() {
+        log(&format!("弃置名单写不进 {}", p.display()));
+        return false;
+    }
+    true
+}
+
 /// 当前角色背包 + 仓库里的 句柄 → 物品编号
 fn scan_inventory() -> HashMap<u32, u32> {
     let mut m = HashMap::new();
@@ -574,6 +607,10 @@ unsafe extern "C" fn fn_call(this: *const LockFn, ret: *mut usize, arg: usize) -
             now
         });
         log(&format!("{}：格子 {} 类别 {} 编号 {}（物品编号 {id:08x}，{name}，参数 {arg:#x}）", if now { "锁定" } else { "解锁" }, key.0, key.1, key.2));
+        // 用户 2026-11-26：刚锁定的武器如果标了弃置，顺手把弃置取消（锁定 = 保护、弃置 = 待处理，两者不能同时成立）
+        if now && key.1 == 0 && drop_discard(key.0, key.2) {
+            log(&format!("锁定：格子 {} 编号 {} 同时取消了弃置", key.0, key.2));
+        }
     }
     let mut tmp = 0usize;
     unsafe {
@@ -728,34 +765,44 @@ unsafe extern "C" fn open_file_hook(opener: usize, path: *const u8, flags: i32, 
 #[repr(C, align(16))]
 struct Elem([u8; 0x60]);
 
-/// 在 root（元素包装）下解析 RngLock，放进栈上的临时包装 e（ResolvePath 在输出包装上从头构造，不看原来的内容）
-unsafe fn resolve_lock(root: usize, e: &mut Elem) -> *mut u8 {
+/// 在 root（元素包装）下解析一个按名字找的子元素，放进栈上的临时包装 e，返回包装指针
+/// （ResolvePath 在输出包装上从头构造，不看原来的内容）
+unsafe fn resolve_named(root: usize, e: &mut Elem, name: &str) -> *mut u8 {
     let w = e.0.as_mut_ptr();
-    let name = [gfx::LOCK_NAME.as_bytes(), b"\0"].concat();
+    let n = [name.as_bytes(), b"\0"].concat();
     unsafe {
         let resolve: ResolveFn = std::mem::transmute(addr(rv().resolve));
-        resolve(root, w, name.as_ptr(), 0);
+        resolve(root, w, n.as_ptr(), 0);
     }
     w
 }
 
-/// 设可见，然后照游戏的做法析构临时包装：只有 +0x28 的值对象要析构（放掉对元素的引用），前面的部分没有要释放的
-unsafe fn set_vis_and_drop(w: *mut u8, show: bool) {
-    unsafe {
-        let setvis: SetVisFn = std::mem::transmute(addr(rv().setvis));
-        setvis(w, show as u8);
-        let dtor: ValDtorFn = std::mem::transmute(addr(rv().val_dtor));
-        dtor(w.add(0x28));
-    }
+/// 设可见（不析构包装）
+unsafe fn set_vis(w: *mut u8, show: bool) {
+    let setvis: SetVisFn = unsafe { std::mem::transmute(addr(rv().setvis)) };
+    unsafe { setvis(w, show as u8) };
+}
+
+/// 照游戏的做法析构临时包装：只有 +0x28 的值对象要析构（放掉对元素的引用），前面的部分没有要释放的
+unsafe fn drop_wrap(w: *mut u8) {
+    let dtor: ValDtorFn = unsafe { std::mem::transmute(addr(rv().val_dtor)) };
+    unsafe { dtor(w.add(0x28)) };
 }
 
 unsafe extern "C" fn bind_hook(cell: usize, root: usize, x: usize, y: usize) -> usize {
     // 根元素是按值传进来的临时对象，原函数结尾会析构它，所以要在调原函数之前解析；原函数之后设成隐藏、析构
-    let mut e = Elem([0; 0x60]);
-    let w = unsafe { resolve_lock(root, &mut e) };
+    let mut e1 = Elem([0; 0x60]);
+    let w1 = unsafe { resolve_named(root, &mut e1, gfx::LOCK_NAME) };
+    let mut e2 = Elem([0; 0x60]);
+    let w2 = unsafe { resolve_named(root, &mut e2, gfx::DISCARD_NAME) };
     let orig: CellFn = unsafe { std::mem::transmute(ORIG_BIND.load(Ordering::Relaxed)) };
     let r = unsafe { orig(cell, root, x, y) };
-    unsafe { set_vis_and_drop(w, false) };
+    unsafe {
+        set_vis(w1, false);
+        set_vis(w2, false);
+        drop_wrap(w1);
+        drop_wrap(w2);
+    }
     if let Ok(mut g) = CELL_SEEN.lock() {
         g.get_or_insert_with(Default::default).insert(cell);
     }
@@ -769,6 +816,59 @@ fn is_locked(handle: u32) -> bool {
         return false;
     }
     item_id(handle).is_some_and(|id| with_locked(|m| m.contains_key(&(slot, cat, key_id(cat, id)))))
+}
+
+/// 弃置名单（角色记录[\联机]\discard_items.txt）：(存档格子, base) 的集合。
+/// 这个文件由 dark_core 写，这里只读；格子刷新每帧都在问，所以缓存 500 毫秒再重读一次（玩家点完弃置最多半秒就看到红叉）
+static DISCARDED: Mutex<Option<(std::time::Instant, std::collections::HashSet<(i32, u32)>)>> = Mutex::new(None);
+
+fn discard_file() -> PathBuf {
+    lock_file().with_file_name("discard_items.txt")
+}
+
+fn with_discarded<R>(f: impl FnOnce(&std::collections::HashSet<(i32, u32)>) -> R) -> R {
+    let mut g = DISCARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let stale = g.as_ref().map_or(true, |(t, _)| t.elapsed().as_millis() >= 500);
+    if stale {
+        let text = fs::read_to_string(discard_file()).unwrap_or_default();
+        let set = text
+            .lines()
+            .map(|l| l.trim_end_matches('\r'))
+            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('\t').collect();
+                Some((f.first()?.parse::<i32>().ok()?, f.get(2)?.parse::<u32>().ok()?))
+            })
+            .collect();
+        *g = Some((std::time::Instant::now(), set));
+    }
+    f(&g.as_ref().unwrap().1)
+}
+
+/// 生成武器的 base：参数行 id / 10000 * 10000（每把独占一行，强化前后不变）
+fn discard_base(id: u32) -> u32 {
+    (id & 0x0FFF_FFFF) / 10000 * 10000
+}
+
+/// 格子上的物品弃置了没有（只武器）
+fn is_discarded(handle: u32) -> bool {
+    let (Some(cat), Some((slot, _))) = (cat_of(handle), character()) else { return false };
+    if cat != 0 {
+        return false;
+    }
+    let Some(id) = item_id(handle) else { return false };
+    let base = discard_base(id);
+    let hit = with_discarded(|m| m.contains(&(slot, base)));
+    if hit {
+        // 命中时记一行，方便反馈"红叉没出现"时区分「没命中」和「命中了没画出来」；格子刷新很频繁，最多 5 秒一行
+        static AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+        let mut g = AT.lock().unwrap_or_else(|e| e.into_inner());
+        if g.map_or(true, |t| t.elapsed().as_secs() >= 5) {
+            *g = Some(std::time::Instant::now());
+            log(&format!("弃置红叉：格子 {slot} 的 {base} 该显示（名单 {} 条）", with_discarded(|m| m.len())));
+        }
+    }
+    hit
 }
 
 #[cfg(test)]
@@ -798,12 +898,20 @@ unsafe extern "C" fn refresh_hook(cell: usize, data: usize, x: usize, y: usize) 
     let seen = data != 0 && CELL_SEEN.lock().is_ok_and(|g| g.as_ref().is_some_and(|s| s.contains(&cell)));
     if seen {
         let h = unsafe { *((data + DATA_HANDLE) as *const u32) };
-        let show = is_locked(h);
-        // 格子 +0 是它的根元素包装（BIND 开头游戏复制进来的，REFRESH 自己也在用）：从它再解析一次，用完析构，不留着
-        let mut e = Elem([0; 0x60]);
+        let (lock, disc) = (is_locked(h), is_discarded(h));
+        // 格子 +0 是它的根元素包装（BIND 开头游戏复制进来的，REFRESH 自己也在用）：从它再解析一次，用完析构，不留着。
+        // 两个都要先解析、再设可见：set_vis_and_drop 末尾会析构包装里的值对象，先析构第一个可能影响第二次解析
+        // （2026-11-27 实测：红叉结构插对了、判断也命中了，就是画不出来）
+        let mut e1 = Elem([0; 0x60]);
+        let mut e2 = Elem([0; 0x60]);
         unsafe {
-            let w = resolve_lock(cell, &mut e);
-            set_vis_and_drop(w, show);
+            let w1 = resolve_named(cell, &mut e1, gfx::LOCK_NAME);
+            let w2 = resolve_named(cell, &mut e2, gfx::DISCARD_NAME);
+            // 两个都设完可见再一起析构：析构会放掉包装里对元素的引用，先析构第一个可能影响第二次设置
+            set_vis(w1, lock);
+            set_vis(w2, disc);
+            drop_wrap(w1);
+            drop_wrap(w2);
         }
     }
     r
@@ -890,7 +998,10 @@ pub unsafe extern "system" fn DllMain(hmodule: u64, reason: u32, _reserved: *mut
     let t = local_time();
     log(&format!("==== {}-{:02}-{:02} 加载（进程 {}）", t.year, t.month, t.day, std::process::id()));
     match install() {
-        Ok(v) => log(&format!("dark_lock 已加载（eldenring.exe {}）：物品弹出菜单里加「锁定 / 解锁」，背包 / 仓库格子显示锁图标", v.version)),
+        Ok(v) => log(&format!(
+            "dark_lock 已加载（eldenring.exe {}）：物品弹出菜单里加「锁定 / 解锁」，背包 / 仓库格子显示锁图标和弃置红叉（红叉是自绘位图 40x42，画在格子正中；锁在左上角）",
+            v.version
+        )),
         Err(e) => log(&format!("dark_lock 不工作：{e}")),
     }
     if dir().join(NO_MENU_TEXT_FILE).exists() {

@@ -13,7 +13,7 @@
 传说及以下）→ 确认框（「〔#I3 …〕」~「〔#I6 …〕」占位，dll\\dark_core 按背包现状改写预计件数）→ 点亮请求标记、弹「已回收」；
 dark_core 把这一档及以下的生成武器换成武器重铸石。提示框关掉时标记还亮着 = DLL 没加载：熄灭标记，改弹「没有加载 dark_core」"""
 from .esdutil import ALWAYS, DIALOG_WAIT, GRACE_WAIT, MENU_WAIT, flag_is_on, i32, menu_parts, menu_pick, option_of, register
-from .sell import TIERS, TIERS_EN
+from .sell import DIGITS, TIERS, TIERS_EN
 
 OPTION, TEXT = 35, 80090004
 OLD = (30, 31, 32)                 # 「更多选项」里原来的护符 / 魔法 / 祷告商店
@@ -30,32 +30,45 @@ NAMES = {'zh': {'menu': '暗黑商店', 'melee': '近战武器商店', 'ranged':
 # 武器回收：菜单项、档位名 4 个、确认框 4 个、已回收、没加载 DLL；确认框占位的种类 3~6（0 一键鉴定、1 / 2 许愿，dark_core 的 confirm_tick）
 RECYCLE_TEXT, R_TIER_TEXT, R_DESC_TEXT, R_DONE_TEXT, R_MISSING_TEXT = 80090200, 80090201, 80090205, 80090209, 80090210
 R_KIND0 = 3
+# 「回收全部弃置」（用户 2026-11-26）：档位名、确认框（80090220 段空着；不能接在 R_DESC_TEXT 后面，那个会撞 R_DONE_TEXT）
+# 确认框占位序号 17（#IH）：dark_core 的 confirm_tick 第 17 项
+R_DISCARD_TEXT, R_DISCARD_DESC, R_DISCARD_KIND = 80090220, 80090221, 17
 FIELD_LEN = {'zh': 30, 'en': 44}                   # 含两端括号的字符数（和一键鉴定一样）
 
 
 def field(kind, lang):
     if lang == 'zh':
-        body = '#I%d 正在清点背包……' % kind
+        body = '#I%s 正在清点背包……' % DIGITS[kind]
         return '〔' + body + ' ' * (FIELD_LEN['zh'] - 2 - len(body)) + '〕'
-    body = '#I%d counting...' % kind
+    body = '#I%s counting...' % DIGITS[kind]
     return '[' + body + ' ' * (FIELD_LEN['en'] - 2 - len(body)) + ']'
 
 
-def recycle_group(p, flags):
-    """装备回收的状态机：0 / 1 档位列表；200 + t 确认框；300 + t 点亮标记、弹提示；400 + t 看 DLL 有没有处理；500 + t 没处理；9 返回"""
+def recycle_group(p, flags, discard=0):
+    """装备回收的状态机：0 / 1 档位列表；200 + t 确认框；300 + t 点亮标记、弹提示；400 + t 看 DLL 有没有处理；500 + t 没处理；9 返回
+    （用户 2026-11-26：第 5 项「回收全部弃置」的标记是 discard，0 = 没有；档位名和确认框文字用新编号）"""
     add_cmd, conf_call, yes_eval, no_eval, ret = (p[k] for k in ('add_cmd', 'conf_call', 'yes_eval', 'no_eval', 'ret'))
     back = dict(add_cmd, args=[i32(99), i32(26000004), i32(-1)])
     show = {'bank': 1, 'id': 10, 'args': [i32(1)]}
     clear = [{'bank': 1, 'id': 12, 'args': []}, {'bank': 1, 'id': 20, 'args': []}]
-    nt = len(flags)
-    st = {0: {'entry': clear + [dict(add_cmd, args=[i32(t + 1), i32(R_TIER_TEXT + t), i32(-1)]) for t in range(nt)] + [back, show],
+    items = list(flags) + ([discard] if discard else [])
+    last = len(flags)
+    nt = len(items)
+
+    def tier_text(t):
+        return R_DISCARD_TEXT if discard and t == last else R_TIER_TEXT + t
+
+    def tier_desc(t):
+        return R_DISCARD_DESC if discard and t == last else R_DESC_TEXT + t
+
+    st = {0: {'entry': clear + [dict(add_cmd, args=[i32(t + 1), i32(tier_text(t)), i32(-1)]) for t in range(nt)] + [back, show],
               'conds': [{'target': 1, 'eval': MENU_WAIT, 'pass': [], 'sub': []}], 'exit': [], 'while': []},
           1: {'entry': [], 'exit': [], 'while': [],
               'conds': [{'target': 200 + t, 'eval': menu_pick(t + 1), 'pass': [], 'sub': []} for t in range(nt)]
               + [{'target': 9, 'eval': ALWAYS, 'pass': [], 'sub': []}]},
           9: {'entry': [], 'exit': [], 'while': [], 'conds': [ret]}}
-    for t, flag in enumerate(flags):
-        st[200 + t] = {'entry': [dict(conf_call, args=[i32(R_DESC_TEXT + t)])], 'exit': [], 'while': [],
+    for t, flag in enumerate(items):
+        st[200 + t] = {'entry': [dict(conf_call, args=[i32(tier_desc(t))])], 'exit': [], 'while': [],
                        'conds': [{'target': 300 + t, 'eval': yes_eval, 'pass': [], 'sub': []},
                                  {'target': 0, 'eval': no_eval, 'pass': [], 'sub': []}]}
         st[300 + t] = {'entry': [{'bank': 1, 'id': 11, 'args': [i32(flag), i32(1)]},
@@ -118,7 +131,7 @@ def esd(cx, groups):
         nid += 1
         while nid in groups:
             nid += 1
-        groups[nid] = recycle_group(p, rec['flags'])
+        groups[nid] = recycle_group(p, rec['flags'], rec.get('discard', 0))
         register(cx, 'recycle', RECYCLE_TEXT, nid)      # 收进「暗黑重铸」（sc/forge.py），不在暗黑商店子菜单里了
     cx.recycle = bool(rec.get('flags'))
     # 子菜单（写法同双子老妪子菜单）；有上架标记的（战灰商店：打败葛瑞克；魔法 / 祷告商店：打败满月女王蕾娜菈）用 5:19 AddTalkListDataIf，标记亮了才列出来
@@ -154,11 +167,12 @@ def texts(cx, key):
     talk = {TEXT: n['menu']}
     talk.update({t: n[k] for k, t in SHOPS})
     if getattr(cx, 'recycle', False):
-        talk.update(recycle_texts(key, (cx.feat.get('recycle') or {}).get('stones') or [1, 2, 3, 4]))
+        rec = cx.feat.get('recycle') or {}
+        talk.update(recycle_texts(key, rec.get('stones') or [1, 2, 3, 4], rec.get('discard', 0)))
     return {'EventTextForTalk': talk, 'GR_MenuText': {int(t): n[k] for k, t in (d.get('titles') or {}).items()}}
 
 
-def recycle_texts(key, stones):
+def recycle_texts(key, stones, discard=0):
     zh = key == 'zh'
     out = {RECYCLE_TEXT: '武器回收' if zh else 'Recycle Weapons',
            R_DONE_TEXT: '已回收，武器重铸石稍后放进背包' if zh else 'Recycled. Weapon Reforge Stones will arrive in your inventory shortly.',
@@ -175,4 +189,16 @@ def recycle_texts(key, stones):
                                     '(per weapon: Common %d, Rare %d, Epic %d, Legendary %d; equipped, locked and stored ones are kept;\n'
                                     'recycled weapons cannot be bought back).\n%s\n\nRecycle them?'
                                     % ((TIERS_EN[t],) + tuple(stones) + (field(R_KIND0 + t, 'en'),)))
+    if discard:
+        out[R_DISCARD_TEXT] = '回收全部弃置' if zh else 'Recycle all discarded'
+        if zh:
+            out[R_DISCARD_DESC] = ('回收背包里所有打了「弃置」标记的武器，换成武器重铸石\n'
+                                   '（每把按自己的稀有度：普通 %d 个、稀有 %d 个、史诗 %d 个、传说 %d 个；\n'
+                                   '装备着的、锁定的、仓库里的不回收，回收后不能买回）。\n%s\n\n确定回收吗？'
+                                   % (tuple(stones) + (field(R_DISCARD_KIND, 'zh'),)))
+        else:
+            out[R_DISCARD_DESC] = ('Recycle all armaments marked as discarded in your inventory into Weapon Reforge Stones\n'
+                                   '(each by its own rarity: Common %d, Rare %d, Epic %d, Legendary %d; equipped, locked and stored ones are kept;\n'
+                                   'recycled weapons cannot be bought back).\n%s\n\nRecycle them?'
+                                   % (tuple(stones) + (field(R_DISCARD_KIND, 'en'),)))
     return out

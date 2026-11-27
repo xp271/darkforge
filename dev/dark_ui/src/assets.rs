@@ -95,10 +95,14 @@ impl Assets {
         !self.sprites.is_empty()
     }
 
-    /// 原版素材（解出来裁成精灵本身的大小）；DR_Lock = 锁定图标（和 dark_lock 在背包格子里画的同一张）
+    /// 原版素材（解出来裁成精灵本身的大小）；DR_Lock = 锁定图标（和 dark_lock 在背包格子里画的同一张），
+    /// DR_Discard = 「弃置」的红叉（用户 2026-11-26 画的，42×42）
     pub fn sprite(&self, name: &str) -> Option<Rgba> {
         if name == "DR_Lock" {
             return lock_icon();
+        }
+        if name == "DR_Discard" {
+            return discard_icon();
         }
         let s = self.sprites.get(name)?;
         let full = decode(s.fmt, &self.blob[s.off..s.off + s.len], s.bw, s.bh)?;
@@ -136,12 +140,25 @@ impl Assets {
     }
 }
 
-/// dark_lock 的锁图（dev\dark_lock\src\lock_bitmap.bin：40×42，和原版「装备中」标记 MENU_EquMark 同画风）：
-/// SWF DefineBitsLossless2 的正文（格式 5 + 宽 + 高 + zlib(预乘 alpha 的 ARGB)）→ RGBA
+/// dark_lock 的锁图（dev\dark_lock\src\lock_bitmap.bin：40×42，和原版「装备中」标记 MENU_EquMark 同画风）
 fn lock_icon() -> Option<Rgba> {
     const LOCK: &[u8] = include_bytes!("../../dark_lock/src/lock_bitmap.bin");
-    let (w, h) = (u16::from_le_bytes([LOCK[1], LOCK[2]]) as u32, u16::from_le_bytes([LOCK[3], LOCK[4]]) as u32);
-    let argb = miniz_oxide::inflate::decompress_to_vec_zlib(&LOCK[5..]).ok()?;
+    swf_bitmap(LOCK)
+}
+
+/// 「弃置」的红叉（dev\dark_ui\src\discard_bitmap.bin：42×42，用户 2026-11-26 自己画的；容器格式和锁图一样）
+fn discard_icon() -> Option<Rgba> {
+    const ICON: &[u8] = include_bytes!("discard_bitmap.bin");
+    swf_bitmap(ICON)
+}
+
+/// SWF DefineBitsLossless2 的正文（格式 5 + 宽 u16 + 高 u16 + zlib(预乘 alpha 的 ARGB)）→ RGBA
+fn swf_bitmap(b: &[u8]) -> Option<Rgba> {
+    if b.len() < 5 || b[0] != 5 {
+        return None;
+    }
+    let (w, h) = (u16::from_le_bytes([b[1], b[2]]) as u32, u16::from_le_bytes([b[3], b[4]]) as u32);
+    let argb = miniz_oxide::inflate::decompress_to_vec_zlib(&b[5..]).ok()?;
     if argb.len() < (w * h * 4) as usize {
         return None;
     }

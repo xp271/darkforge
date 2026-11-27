@@ -109,9 +109,23 @@ impl Workshop {
         self.oaffs().get(i).is_some_and(|(_, u)| u.ok && u.cost <= self.ohave())
     }
 
-    /// 右边最后一个按钮的序号：武器 2；防具 2 + 词条数
+    /// 右边最后一个按钮的序号：武器 3（0~2 用石头，3 弃置）；防具 2 + 词条数（防具没有弃置）
     fn obtn_max(&self) -> usize {
-        if self.otab == 1 { 2 + self.oaffs().len() } else { 2 }
+        if self.otab == 1 {
+            2 + self.oaffs().len()
+        } else {
+            3
+        }
+    }
+
+    /// 选中的是「弃置」按钮（只有武器栏有）
+    pub(super) fn odiscard_sel(&self) -> bool {
+        self.otab == 0 && self.obtn == 3
+    }
+
+    /// 能不能弃置：选中了一把武器、明细加载了、没装备着、没锁定
+    fn can_discard(&self) -> bool {
+        matches!(self.oitem(), Some(OItem::W(w)) if w.loaded && !w.worn && !w.locked)
     }
 
     fn ouse(&self) -> u32 {
@@ -151,7 +165,18 @@ impl Workshop {
                 self.obtn += 1;
             }
             if a.a {
-                self.confirm = self.can_overlimit() || self.can_affix();
+                if self.odiscard_sel() {
+                    // 弃置是静默切换（用户 2026-11-26）：不弹确认框，直接提请求，dark_core 改完名单回一句结果
+                    if self.can_discard() {
+                        if let Some(OItem::W(w)) = self.oitem() {
+                            self.reqs.push(Req::Discard(w.idx));
+                            self.waiting = true;
+                            self.msg = Some((true, self.t("处理中……", "Working…").to_string()));
+                        }
+                    }
+                } else {
+                    self.confirm = self.can_overlimit() || self.can_affix();
+                }
             } else if a.left || a.lb {
                 self.ocol = 0;
             }
@@ -270,12 +295,12 @@ impl Workshop {
                 d.sprite("MENU_FL_Cursor_Wide", x - 8.0, ry + 2.0, w + 16.0, rh - 4.0, if self.ocol == 0 && !self.head { 1.0 } else { 0.45 });
             }
             if it.loaded() {
-                let (icon, worn, locked, rar, name, sub) = match &it {
-                    OItem::W(wp) => (wp.icon, wp.worn, wp.locked, wp.rar, &wp.name, format!("{} · +{}", wtype_name(wp.wtype, l), wp.level)),
-                    OItem::A(p, _) => (p.icon, p.worn, p.locked, p.rar, &p.name, PART[l][p.part.min(3)].to_string()),
+                let (icon, worn, locked, disc, rar, name, sub) = match &it {
+                    OItem::W(wp) => (wp.icon, wp.worn, wp.locked, wp.discard, wp.rar, &wp.name, format!("{} · +{}", wtype_name(wp.wtype, l), wp.level)),
+                    OItem::A(p, _) => (p.icon, p.worn, p.locked, false, p.rar, &p.name, PART[l][p.part.min(3)].to_string()),
                 };
                 d.icon(icon, x + 12.0, ry + 6.0, 64.0, 1.0);
-                d.badges(x + 13.0, ry + 7.0, 20.0, worn, locked);
+                d.badges(x + 13.0, ry + 7.0, 20.0, 64.0, worn, locked, disc);
                 d.text_clip(x + 92.0, ry + 10.0, w - 100.0, 24.0, RAR[rar.min(3)], 1.0, name);
                 d.text(x + 92.0, ry + 44.0, 19.0, DIM, 1.0, &sub);
                 let tag = if it.need() == 0 {
@@ -433,10 +458,12 @@ impl Workshop {
         }
         d.text(x, by - 6.0, 16.0, DIM, 1.0, self.t("刻度：暗 = 中位，金 = 原上限；金色部分超过原上限", "Ticks: dim = median, gold = original cap; gold fill is beyond the cap"));
         by += 30.0;
-        // 按钮
+        // 按钮（武器栏 4 个：用 1 颗 / 用 10 颗 / 用到上限 / 弃置；防具栏只有前 3 个，接着是词条升级）
         let need = it.need();
         let have = self.ohave();
-        for i in 0..3 {
+        let nb = if armor { 3 } else { 4 };
+        let discarded = matches!(&it, OItem::W(wp) if wp.discard);
+        for i in 0..nb {
             let (bx, bw, bh) = (x, w, 58.0);
             let focus = self.ocol == 1 && self.obtn == i;
             let n = self.ouse_of(i, need);
@@ -444,19 +471,24 @@ impl Workshop {
                 d.sprite("MENU_FL_Cursor_Ent", bx, by, bw, bh, 1.0);
             }
             d.sprite("MENU_FL_Cursor_EntWaku", bx, by, bw, bh, if focus { 1.0 } else { 0.6 });
-            let label = match (i, l) {
-                (0, 0) => "用 1 颗".to_string(),
-                (1, 0) => "用 10 颗".to_string(),
-                (_, 0) => format!("用到上限（还要 {need} 颗）"),
-                (0, _) => "Use 1".to_string(),
-                (1, _) => "Use 10".to_string(),
-                _ => format!("Use to cap ({need} needed)"),
+            let label = if i == 3 {
+                self.t(if discarded { "取消弃置" } else { "弃置" }, if discarded { "Un-discard" } else { "Discard" }).to_string()
+            } else {
+                match (i, l) {
+                    (0, 0) => "用 1 颗".to_string(),
+                    (1, 0) => "用 10 颗".to_string(),
+                    (_, 0) => format!("用到上限（还要 {need} 颗）"),
+                    (0, _) => "Use 1".to_string(),
+                    (1, _) => "Use 10".to_string(),
+                    _ => format!("Use to cap ({need} needed)"),
+                }
             };
             let lw = d.width(&label, 24.0);
             if i == self.obtn {
                 d.glyph(if focus { "KG_XboxSeries_R_D" } else { "KG_XboxSeries_R_U" }, bx + (bw - lw) / 2.0 - 44.0, by + (bh - 34.0) / 2.0, 34.0);
             }
-            d.text_mid(bx + (bw - lw) / 2.0, by + bh / 2.0, 24.0, if n > 0 { TEXT } else { DIM }, 1.0, &label);
+            let on = if i == 3 { self.can_discard() } else { n > 0 };
+            d.text_mid(bx + (bw - lw) / 2.0, by + bh / 2.0, 24.0, if on { TEXT } else { DIM }, 1.0, &label);
             self.hit(bx, by, bw, bh, Hit::OBtn(i));
             by += bh + 10.0;
         }

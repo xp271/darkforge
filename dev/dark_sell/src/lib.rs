@@ -63,6 +63,10 @@ const SELL_FLAGS: [u32; COMBOS] = [
     93000, 93001, 93002, 93003, 93004, 93005, 93006, 93007, 93008, 93009, 93010, 93011, //
     92780, 92781, 92782, 92783, 92784, 92785, 92786, 92787, 92788, 92789, 92790, 92791,
 ];
+/// 「出售全部弃置」的请求标记（用户 2026-11-26，sc/sell.py 第 7 项）：单独一个，不进上面 24 个组合
+/// （93019 原为圆顶请求、已停用，dev\event_flags\说明.md 明确「没别人用，可以再分配」。
+///  最初用的 93012 和许愿石请求撞了，2026-11-26 首次实测踩到：点回收弃置被这里抢先卖了）
+const SELL_DISCARD_FLAG: u32 = 93019;
 const TIERS: usize = 4;
 const CATS: usize = 3;
 /// 0 背包 / 1 木箱
@@ -119,7 +123,8 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 static REMOVE_ITEM: OnceLock<Option<usize>> = OnceLock::new();
 static RNG_ITEMS: OnceLock<HashSet<(u8, u32)>> = OnceLock::new();
 /// 确认框各序号上次交给 dark_core 的文字（没变就不再交）
-static FIELD_TEXT: Mutex<[String; COMBOS]> = Mutex::new([const { String::new() }; COMBOS]);
+/// 确认框里的预计文字（24 个组合 + 1 个「出售全部弃置」，见 write_fields）
+static FIELD_TEXT: Mutex<[String; COMBOS + 1]> = Mutex::new([const { String::new() }; COMBOS + 1]);
 /// dark_core 的 dr_msg_confirm 的地址（0 = 还没找到）；找不到时记过一行日志没有
 static CONFIRM_FN: AtomicUsize = AtomicUsize::new(0);
 static CONFIRM_TOLD: AtomicBool = AtomicBool::new(false);
@@ -391,6 +396,25 @@ fn locked_keys() -> HashSet<(u8, u32)> {
     text.lines().filter_map(|l| lock_line(l, slot)).collect()
 }
 
+/// 弃置名单（dark_core 的 gear.rs 写的，工坊「超限」页武器栏第 4 个按钮）：这个角色的生成武器 base 编号。
+/// 键是 base（param_id / 10000 * 10000，每把生成武器独占一条参数行），所以只跟武器对得上。
+/// 这里只读不写（写名单的是 dark_core 和 dark_lock，别两边同时改）
+fn discard_keys() -> HashSet<u32> {
+    let Some(slot) = unsafe { GameMan::instance() }.ok().map(|g| g.save_slot) else { return HashSet::new() };
+    let text = rec_text("discard_items.txt").unwrap_or_default();
+    text.lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.trim_end_matches('\r').split('\t').collect();
+            (f.len() >= 3 && f[0].parse::<i32>().ok() == Some(slot)).then(|| f[2].parse::<u32>().ok()).flatten()
+        })
+        .collect()
+}
+
+/// 物品编号（含类别位、含强化等级）→ 生成武器的 base
+fn pid_base(raw: u32) -> u32 {
+    (raw & 0x0FFF_FFFF) / 10000 * 10000
+}
+
 /// 名单的一行，是这个格子的就返回 sell_key
 fn lock_line(line: &str, slot: i32) -> Option<(u8, u32)> {
     let f: Vec<&str> = line.split('\t').collect();
@@ -512,6 +536,47 @@ fn sell_batch(place: usize, sell_cat: u8, max_rarity: u8) -> Option<(u32, u32)> 
     Some((n, runes))
 }
 
+/// 「出售全部弃置」（用户 2026-11-26，sc/sell.py 的第 7 项）：背包里命中弃置名单的装备按售价卖掉。
+/// 和 sell_batch 同一套（RNG 名单、装备中/锁定排除、售价、移除、加卢恩），只把筛选条件从「类别 + 稀有度档」换成「命中弃置名单」；
+/// 只背包（弃置只能从工坊打，工坊只列背包；木箱那三类完全不受影响）
+fn sell_discarded() -> Option<(u32, u32)> {
+    let gdm = unsafe { GameDataMan::instance_mut() }.ok()?;
+    let f = remove_item_fn()?;
+    let pgd: &mut PlayerGameData = &mut gdm.main_player_game_data;
+    let inv_ptr = place_inv(pgd, 0)?;
+    let inv = unsafe { &mut *inv_ptr };
+    let key_cap = inv.items_data.key_items_capacity;
+    let disc = discard_keys();
+    let picks: Vec<(usize, u32, u32, u32)> = sellable(pgd, inv, false, &locked_keys())
+        .into_iter()
+        .filter(|p| disc.contains(&pid_base(p.raw)))
+        .map(|p| (p.idx, p.raw, p.qty, p.price))
+        .collect();
+    let remove = unsafe { std::mem::transmute::<usize, RemoveItemFn>(f) };
+    let (mut n, mut runes, mut fail) = (0u32, 0u32, 0u32);
+    for (idx, raw, qty, price) in picks {
+        let still = inv.items_data.normal_entries()[idx].as_option().filter(|it| it.item_id.into_inner() == raw).map(|it| it.quantity);
+        if still != Some(qty) {
+            fail += 1;
+            continue;
+        }
+        unsafe { remove(inv_ptr, key_cap + idx as u32, qty) };
+        let after = inv.items_data.normal_entries()[idx].as_option().filter(|it| it.item_id.into_inner() == raw).map(|it| it.quantity);
+        let sold = qty - after.unwrap_or(0).min(qty);
+        if sold == 0 {
+            fail += 1;
+            continue;
+        }
+        n += sold;
+        runes = runes.saturating_add(price.saturating_mul(sold));
+    }
+    pgd.rune_count = pgd.rune_count.saturating_add(runes).min(MAX_RUNES);
+    if fail > 0 {
+        log(&format!("出售（全部弃置）：{fail} 件没卖掉（格子变了或移除失败）"));
+    }
+    Some((n, runes))
+}
+
 fn group_digits(v: u32) -> String {
     let s = v.to_string();
     let mut out = String::new();
@@ -581,6 +646,32 @@ fn write_fields() {
         let (z, e): (Vec<u16>, Vec<u16>) = (zh.encode_utf16().collect(), en.encode_utf16().collect());
         unsafe { publish(b'S', i as u8, z.as_ptr(), z.len(), e.as_ptr(), e.len()) };
         last[i] = key;
+    }
+    // 第 25 项（#SO）：「出售全部弃置」的预计（只背包、命中弃置名单的）
+    let (dn, dr) = {
+        let mut acc = (0u32, 0u32);
+        if let Some(inv_ptr) = place_inv(pgd, 0) {
+            let inv = unsafe { &*inv_ptr };
+            let disc = discard_keys();
+            for p in sellable(pgd, inv, false, &locked) {
+                if disc.contains(&pid_base(p.raw)) {
+                    acc.0 += p.qty;
+                    acc.1 = acc.1.saturating_add(p.price.saturating_mul(p.qty));
+                }
+            }
+        }
+        acc
+    };
+    let (zh, en) = if dn == 0 {
+        ("没有可出售的弃置武器".to_string(), "No discarded items to sell".to_string())
+    } else {
+        (format!("预计卖出 {dn} 件，约 {} 卢恩", group_digits(dr)), format!("Est. {dn} items for {} runes", group_digits(dr)))
+    };
+    let key = format!("{zh}|{en}");
+    if last[COMBOS] != key {
+        let (z, e): (Vec<u16>, Vec<u16>) = (zh.encode_utf16().collect(), en.encode_utf16().collect());
+        unsafe { publish(b'S', COMBOS as u8, z.as_ptr(), z.len(), e.as_ptr(), e.len()) };
+        last[COMBOS] = key;
     }
 }
 
@@ -851,25 +942,44 @@ fn poll_sell() {
         format!("{} · {} · {}", PLACE_NAMES[place], CAT_NAMES[cat as usize], TIER_NAMES[tier as usize])
     };
     let lit: Vec<usize> = (0..COMBOS).filter(|&i| flags.virtual_memory_flag.get_flag(SELL_FLAGS[i])).collect();
-    if lit.is_empty() {
+    // 「出售全部弃置」是单独的标记（sc/sell.py 第 7 项），和 24 个组合一样按「一次只亮一个」处理
+    let disc = flags.virtual_memory_flag.get_flag(SELL_DISCARD_FLAG);
+    if lit.is_empty() && !disc {
         return;
     }
     for &i in &lit {
         flags.virtual_memory_flag.set_flag(SELL_FLAGS[i], false);
     }
-    let names = || lit.iter().map(|&i| name(i)).collect::<Vec<_>>().join("、");
+    if disc {
+        flags.virtual_memory_flag.set_flag(SELL_DISCARD_FLAG, false);
+    }
+    let names = || {
+        let mut v: Vec<String> = lit.iter().map(|&i| name(i)).collect();
+        if disc {
+            v.push("全部弃置".to_string());
+        }
+        v.join("、")
+    };
     if frames <= SELL_SETTLE_FRAMES {
         log(&format!("一键出售：进存档时请求标记还亮着（存档里残留的：{}），熄灭、不卖", names()));
         return;
     }
-    if lit.len() > 1 {
-        log(&format!("一键出售：同时亮了 {} 个请求（{}），不是从菜单点的，全部熄灭、不卖", lit.len(), names()));
+    if lit.len() > 1 || (disc && !lit.is_empty()) {
+        log(&format!("一键出售：同时亮了 {} 个请求（{}），不是从菜单点的，全部熄灭、不卖", lit.len() + disc as usize, names()));
         return;
     }
     let anim = player_anim();
     if !at_grace(anim) {
         let a = anim.map(|a| a.to_string()).unwrap_or_else(|| "读不到".to_string());
         log(&format!("一键出售：请求（{}）亮了，但人物不在赐福点（动画 {a}），不是从菜单点的，熄灭、不卖", names()));
+        return;
+    }
+    if disc {
+        match catch_unwind(AssertUnwindSafe(sell_discarded)) {
+            Ok(Some((n, runes))) => log(&format!("一键出售（全部弃置）：卖了 {n} 件，得到 {runes} 卢恩")),
+            Ok(None) => log("一键出售（全部弃置）：没卖（没进存档 / 找不到移除函数 / 地址对不上）"),
+            Err(_) => log("一键出售（全部弃置）：出错（已跳过）"),
+        }
         return;
     }
     let i = lit[0];
@@ -968,6 +1078,10 @@ mod tests {
         assert_eq!(lock_line("2	0	197150004	D", 6), None);
         assert_eq!(lock_line("6	b0000001	00000001	D", 6), None);
         assert_eq!(lock_line("# 格子	类别	编号	角色名", 6), None);
+        // 弃置名单的 base：去掉类别位（高 4 位）和强化等级（level = pid - base，+1 步进）
+        assert_eq!(pid_base(0x0E4E1C00), 240_000_000);
+        assert_eq!(pid_base(0x8E4E1C00), 240_000_000);
+        assert_eq!(pid_base(0x8E4E1C19), 240_000_000);
     }
 
     #[test]
@@ -988,6 +1102,11 @@ mod tests {
         assert!(SELL_FLAGS[..half].iter().all(|f| (93000..93012).contains(f) && !free.contains(f)));
         assert!(SELL_FLAGS[half..].iter().all(|f| (92780..92792).contains(f)));
         assert!(free.start >= 93020 && free.end <= 93050);
+        // 「出售全部弃置」是单独一个标记，不能和 24 个组合撞，也不能和许愿石（93012~93017）撞
+        // 2026-11-26 实测踩过：用 93012 时点「回收全部弃置」被这边抢先卖了 5 把
+        assert!(!s.contains(&SELL_DISCARD_FLAG));
+        assert_eq!(SELL_DISCARD_FLAG, 93019);
+        assert!(!(93012..=93017).contains(&SELL_DISCARD_FLAG));
     }
 
     #[test]
