@@ -293,6 +293,89 @@ def split_element_moves(ctx):
         '；几把面板不同的本体共用一个变体（照编号最小的算）：%s' % mixed if mixed else ''))
 
 
+# 单个战技的动作值倍数（skill_mv_scale，用户 2026-11-27「单独削弱下发劲和多重投掷 最高总倍率变为现在0.5倍」）：
+# 战技编号 → 它的攻击行（开发时按 c0000 动作包里这个战技的判定 → 行为 → 攻击行查的，这些行只有这个战技自己的行为在用）；
+# 五项动作值（atk*Correction，吃武器面板的那部分）乘倍数，固定攻击力不动。武器大类自己的变体行（发劲 602420xxx，动作值本来是 0）不在里面。
+# 要在 split_element_moves 之后（专属战技的动作值先统一）、范围放大和专属战技战灰复制行之前
+SKILL_MV_ROWS = {
+    4010: (600000001, 600000002, 600000006, 600000007),                          # 发劲：提前松手 220 / 120，按满 460 / 180
+    4030: (600000120, 600000121, 600000122, 600000123, 600000128, 600000129),    # 多重投掷（战灰）：每把 88 + 落地 53、双手 70
+    5510: (600001000, 600001001, 600001002, 600001003, 600001008, 600001009),    # 多重投掷（专属）：每把 70 + 落地 39、双手 70
+}
+
+
+def skill_mv_scale(ctx):
+    conf = ctx.S.get('skill_mv_scale') or {}
+    skills = {int(k): float(v) for k, v in (conf.get('skills') or {}).items()}
+    if not conf.get('enabled', True) or not skills:
+        return
+    al = {f: (o, fc) for f, fc, o, bp, bits, d in pdm.layout(pdm.load(os.path.join(ctx.data_dir, 'AtkParam.xml')))[0] if not bits}
+    AT = erlib.Param(ctx.bnd.get('AtkParam_Pc.param'))
+    done, miss = [], []
+    for sid, m in sorted(skills.items()):
+        rows = [a for a in SKILL_MV_ROWS.get(sid, ()) if a in AT.rows]
+        if not rows:
+            miss.append(str(sid))
+            continue
+        for a in rows:
+            row = AT.rows[a]
+            for f in ELEM_CORR:
+                v = struct.unpack_from('<' + al[f][1], row, al[f][0])[0]
+                if v:
+                    struct.pack_into('<' + al[f][1], row, al[f][0], min(65535, int(round(v * m))))
+        done.append('%d ×%g（%d 行）' % (sid, m, len(rows)))
+    ctx.bnd.put('AtkParam_Pc.param', AT.serialize())
+    ctx.report.append('单个战技的动作值倍数：%s%s' % ('、'.join(done) or '没有', '；不认得的战技 %s' % '、'.join(miss) if miss else ''))
+
+
+# 战技补正跟武器（skill_correct_follow_weapon，用户 2026-11-27「可以把战技的补正都改为跟武器吗」「直接改」）：
+# 原版战灰的攻击行大多改写了属性补正表（overwriteAttackElementCorrectId → 51010~51120 这类：只吃一项能力值、补正值写死 25，
+# 两项的各 15），装在什么武器上都一样；少数专属战技也有自己的表（约定之王圣←智、兽王爪、尸蜡斩击不吃能力值等）。
+# 清成 -1 = 按武器自己的属性补正表和补正值算（生成武器是 42300：五种伤害都吃武器有补正的几项）。
+# 战技 = 行为 3 亿段（本体）和 6 亿段（黄金树幽影），顺着子弹 / 命中后子弹 / 间隔生成子弹找；和普通攻击 / 法术 / 道具共用的行不动。
+# 在范围放大、专属战技战灰之前（复制的行带上改过的）
+def skill_correct_follow_weapon(ctx):
+    if not ctx.S.get('skill_correct_follow_weapon', True):
+        return
+    lay = lambda n: {f: (o, fc) for f, fc, o, bp, bits, d in pdm.layout(pdm.load(os.path.join(ctx.data_dir, n + '.xml')))[0] if not bits}
+    bl, ul, al = lay('BehaviorParam'), lay('BulletParam'), lay('AtkParam')
+    get = lambda o, row, n: struct.unpack_from('<' + o[n][1], row, o[n][0])[0]
+    BP, BU, AT = (erlib.Param(ctx.bnd.get(n + '.param')) for n in ('BehaviorParam_PC', 'Bullet', 'AtkParam_Pc'))
+
+    def atks(row):
+        rt, ref = get(bl, row, 'refType'), get(bl, row, 'refId')
+        out, seen, todo = set(), set(), []
+        if rt == 0:
+            out.add(ref)
+        elif rt == 1:
+            todo.append(ref)
+        while todo:
+            b = todo.pop()
+            if b in seen or b not in BU.rows:
+                continue
+            seen.add(b)
+            out.add(get(ul, BU.rows[b], 'atkId_Bullet'))
+            todo += [v for v in (get(ul, BU.rows[b], 'HitBulletID'), get(ul, BU.rows[b], 'intervalCreateBulletId')) if v > 0]
+        return {a for a in out if a > 0 and a in AT.rows}
+    skill, other = set(), set()
+    for rid, row in BP.rows.items():
+        (skill if rid // 100000000 in (3, 6) else other).update(atks(row))
+    f = 'overwriteAttackElementCorrectId'
+    own = sorted(a for a in skill if get(al, AT.rows[a], f) > 0)
+    tables = Counter()
+    shared = 0
+    for a in own:
+        if a in other:
+            shared += 1
+            continue
+        tables[get(al, AT.rows[a], f)] += 1
+        struct.pack_into('<' + al[f][1], AT.rows[a], al[f][0], -1)
+    ctx.bnd.put('AtkParam_Pc.param', AT.serialize())
+    ctx.report.append('战技补正跟武器：%d 行攻击参数不再用自己的补正表（%s）%s' % (
+        sum(tables.values()), '、'.join('%d ×%d' % kv for kv in tables.most_common()) or '没有',
+        '；和普通攻击 / 法术 / 道具共用的 %d 行没动' % shared if shared else ''))
+
+
 # 道具补正（item_scaling_mult，用户 2026-11-05「修改所有道具的补正到现在的2.5倍」）：道具的能力补正在它的虚拟武器上
 # （EquipParamGoods.refVirtualWepId → EquipParamWeapon，wepType 0，玩家拿不到），伤害 = 道具的固定攻击力 × (100 + Σ 补正值 × 曲线) ÷ 100，菜单上的补正也读它。
 # 几个道具共用一行的只乘一次

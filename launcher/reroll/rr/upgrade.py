@@ -4,7 +4,8 @@ dll\\dark_core 改写容器行时按「本体的强化类型 × 稀有度 × 是
 
 - 成长（growth）：+k 相当于原版这个强化类型的 (k / 5 × growth × 满级) 级，满级是 +25（失色 +10），中间线性插值。
   传说 1.0（+5 = 原版满级）、史诗 0.8（≈ 传说 +4）、稀有 0.5（≈ 传说 +2.5）、普通 0.2（≈ 传说 +1）。
-- 战技的固定伤害（baseAtkRate，如神圣刀刃的圣）、强化价格、maxReinforceLevel 不看稀有度：+5 都是原版满级（用户：满强和原版一致）。
+- 战技的固定伤害（baseAtkRate，如神圣刀刃的圣）、强化价格、maxReinforceLevel 不看稀有度：+5 都是原版满级（用户：满强和原版一致）；
+  固定伤害的倍数另外压到 flat_max（2026-11-27 起 ×2，原版满级 ×4）。
 - 全能（五项属性都有补正）和其他武器同一个强化类型（用户 2026-11-24「只用一个参数控制」：以前全能的补正成长只算 omni_scaling 0.583，
   照 0.6.2 的全能 ×1.35 / 其他 ×1.6；现在全能的打折只看 weapon_scaling.omni，dark_core 写参数行时乘，rr/affixes.py omni_mult）。
 - 编号：强化类型 TYPE_BASE 起每个占 100（原版到 9010，reinforceTypeId 是 s16）；材料组 MAT_BASE + 稀有度 × 10 + 等级。
@@ -29,7 +30,15 @@ STONES = {
 GROWTH = {'Common': 0.2, 'Rare': 0.5, 'Epic': 0.8, 'Legendary': 1.0}
 # 看「满级」算的字段（不随稀有度打折）；整数字段（异常偏移等，原版这几类都是 0）照低一级那行
 FULL_F = ('baseAtkRate', 'reinforcePriceRate')
+# 战技固定伤害（baseAtkRate）+5 满级的倍数（用户 2026-11-27「下调至2倍」：战技补正改成跟武器以后固定伤害吃能力值多了，原版满级 ×4 降到 ×2）；
+# +0 ×1 到 +5 ×flat_max 直线（原版几乎都是 +0 ×1 到满级 ×4 的直线：+1 ×1.2 … +5 ×2；强化类型 8600 的 +0 是 3.88、+1 起才从 1 涨，
+# 照它等比压的话 +0 比 +1 还高，所以不照原版的形状）；0 = 照原版满级
+FLAT_MAX = 2.0
 CORRECT_F = ('correctStrengthRate', 'correctAgilityRate', 'correctMagicRate', 'correctFaithRate', 'correctLuckRate')
+# 力敏的补正倍率提到和智力一样的强化类型（用户 2026-11-27「有些武器的全能为什么力敏的补正会略低」→「提到 ×1.8」）：
+# 原版普通锻造石那条（0，本体 238 把）满级力敏 ×1.5、智信感 ×1.8——原版这类武器只有力敏补正，另外三项的倍数用不上；
+# 生成武器五项都可能有，力敏就比另外三项低一截。失色那条（2200）等其他强化类型五项本来一样。每一级照同级的智力倍数
+EVEN_STR_DEX = (0,)
 
 
 def cfg(S):
@@ -40,7 +49,7 @@ def cfg(S):
     if len({len(v) for v in stones.values()}) != 1 or not stones['Common']:
         raise RuntimeError('weapon_upgrade.stones：各稀有度的石头数要一样（= 最高强化等级）')
     return dict(stones=stones, growth={r: float((c.get('growth') or {}).get(r, GROWTH[r])) for r in RAR},
-                max=len(stones['Common']))
+                max=len(stones['Common']), flat_max=float(c.get('flat_max', FLAT_MAX) or 0))
 
 
 FULLWIDTH = str.maketrans('0123456789', '０１２３４５６７８９')
@@ -179,7 +188,12 @@ def build(ctx):
                 if ref is not None:
                     rv, _ = level_row(ref, tops[ref], full * c['growth'][r] * tops[ref] / top)
                     vals.update({f: rv[f] for f in CORRECT_F})
+                if (src_t if ref is None else ref) in EVEN_STR_DEX:
+                    for f in CORRECT_F[:2]:
+                        vals[f] = max(vals[f], vals['correctMagicRate'])
                 full_vals, full_src = level_row(src_t, top, full)
+                if c['flat_max'] > 0:
+                    full_vals['baseAtkRate'] = 1 + (c['flat_max'] - 1) * lv / n_lv
                 row = bytearray(src)
                 for f in floats:
                     p(rl, row, f, full_vals[f] if f in FULL_F else vals[f])

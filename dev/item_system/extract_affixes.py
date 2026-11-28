@@ -94,6 +94,10 @@ RESET = {'increase_dealt_damage_when_at_full_hp_by_pct': (ATK_RATES, {'Common': 
          'increase_spells_duration_by_pct': (('extendLifeRate',), {'Common': 33, 'Rare': 53, 'Epic': 73, 'Legendary': 100})}
 # 直接定数值的（字段本身就是这个数，不是倍率）：词条 → (字段, {稀有度: 数值})。咏唱加速：用户 2026-11-06「虚拟灵巧那个词条传说改为+99」「其他稀有度缩放一下」（字段 s8，以前 20 / 28 / 38 / 50，都 ×99/50）
 RESET_VAL = {'adds_virtual_dex_toward_speed_casting': ('dexterityCancelSystemOnlyAddDexterity', {'Common': 40, 'Rare': 55, 'Epic': 75, 'Legendary': 99})}
+# 满蓄力只管蓄力魔法、祷告（用户 2026-11-27「满蓄力可以把战技伤害单独去掉吗」→「改」）：效果行认的攻击子类别 110（蓄力魔法 / 祷告，
+# 原版攻击参数里 155 行全是法术）留着，111（蓄力战技，68 行全是战技）清掉；说明跟着改，流派按新说明归「法术」（ARCHETYPES）
+CHARGED_SPELL = dict(key='increase_damage_of_fully_charged_skills_or_spell', keep=110, drop=111,
+                     zh='蓄力使用魔法、祷告时的伤害＋#％', en='Increase damage of fully charged sorceries and incantations by #%')
 # 词条改造：词条 →（后缀（英, 中）、改回 1 的倍率字段（去掉这部分效果）、新说明（英, 中；# 按原说明的数值顺序填））
 # 斩击优化 → 战技优化，去掉「精力上限降低」（用户 2026-10-31）；咏唱优化去掉「血量上限降低」（用户 2026-11-01）
 REWORK = {'decrease_cost_of_ashes_of_war_and_decrease_max_s': (('optimized skills', '战技优化'), ('maxStaminaRate',),
@@ -934,7 +938,8 @@ BLOODRAGE = dict(pct=4, hp=0.5, max=10, reset=5.0,
 ARCHETYPES = [                      # (流派, 说明里的关键词)：按顺序找，先命中的算
     ('异常', ['周围发生', '异常累积', '发作']),
     ('命中连击', ['近战攻击命中', '持续以近战攻击', '狂暴地以近战攻击', '近战攻击连续命中', '近战武器命中敌人', '连续攻击的最后一记', '装备重量越轻']),
-    ('法术', ['魔法伤害＋', '祷告伤害＋', '咆哮与吐息', '咏唱', '魔法、祷告消耗', '魔法、祷告的有效时间', '魔法、祷告与战技', '魔法与祷告', '法球']),
+    ('法术', ['魔法伤害＋', '祷告伤害＋', '咆哮与吐息', '咏唱', '魔法、祷告消耗', '魔法、祷告的有效时间', '魔法、祷告与战技', '魔法与祷告', '法球',
+            '蓄力使用魔法、祷告时']),
     ('战技', ['战技伤害', '战技消耗', '蓄力使用魔法', '霸体']),
     ('防御', ['防御时被削减', '防御时，受到', '防御反击', '中断攻击', '壁垒', '破防', '泡状护盾', '相杀']),
     ('机动空战', ['跳跃攻击', '起跳后', '冲刺攻击', '骑马时', '移动速度', '空中']),
@@ -1786,6 +1791,25 @@ class Extract:
                 f['text'][r] = {'zh': fill(zh), 'en': fill(en)}
             self.report.append('词条改造 %s → %s：%s 改回 1，说明「%s」（%s）' % (
                 old, suffix[1], '、'.join(fields), zh, ' / '.join(','.join(f['vals'][r]) for r in RAR if r in f['vals'])))
+
+    def charged_spell(self, gear):
+        """满蓄力：见 CHARGED_SPELL（在 rescale 定数值之后；流派在 merge_and_balance 按说明分）"""
+        c = CHARGED_SPELL
+        f = gear[c['key']]
+        for r, s in f['sp'].items():
+            row = bytearray(self.rows['SpEffectParam'][s])
+            subs = [getf(self.SP, row, 'magicSubCategoryChange%d' % j) for j in (1, 2, 3)]
+            if c['keep'] not in subs or c['drop'] not in subs:
+                raise RuntimeError('%s：效果 %d 的攻击子类别是 %s，没有 %d / %d' % (f['zh'], s, subs, c['keep'], c['drop']))
+            for j, v in enumerate(subs, 1):
+                if v == c['drop']:
+                    setf(self.SP, row, 'magicSubCategoryChange%d' % j, 0)
+            self.rows['SpEffectParam'][s] = bytes(row)
+            fill = lambda t: re.sub('#', lambda m, v=iter(f['vals'][r]): next(v), t)
+            f['text'][r] = {'zh': fill(c['zh']), 'en': fill(c['en'])}
+        f['zh'], f['en'] = c['zh'], c['en']
+        self.report.append('词条改造 %s：只认蓄力魔法、祷告（攻击子类别 %d），去掉蓄力战技（%d）（%s）' % (
+            f['suffix'][1], c['keep'], c['drop'], ' / '.join(','.join(f['vals'][r]) for r in RAR if r in f['vals'])))
 
     def crit_rage(self, gear):
         """狂怒突刺：见 CRIT_RAGE（要在 rule_affixes 之后、custom_shared 之前：resolve_logic 记事件，custom_shared 建脉冲标记）"""
@@ -3098,6 +3122,7 @@ def main():
     x.load_speed(gear)
     x.high_hp(gear)
     x.item_dmg(gear)
+    x.charged_spell(gear)
     x.hp_drain(gear)
     weapon = x.weapons()
     # 装备记录 / 存档里存的编号由 pin 按名字锁定（id_lock.json），步骤的先后不再影响它们；内部行每次整体重建

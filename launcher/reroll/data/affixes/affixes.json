@@ -1,7 +1,7 @@
 {
  "_说明": "词条库（阶段 1：迁移原包的词条）。由 dev\\item_system\\extract_affixes.py 从 RNG Lands 原包提取，不要手改；规则见 dev\\item_system\\词条一览.md、设计文档.md 第 8 节。权重 / 分布里的数字都是原包里的件数。",
  "source": "packs\\Ruby\\recommended increased difficulty",
- "time": "2026-11-24 23:07:25",
+ "time": "2026-11-27 15:29:05",
  "rarities": [
   "Common",
   "Rare",
@@ -10850,8 +10850,8 @@
    }
   },
   "increase_damage_of_fully_charged_skills_or_spell": {
-   "zh": "蓄力使用魔法、祷告、战技时的伤害＋#％",
-   "en": "Increase damage of fully charged skills or spells by #%",
+   "zh": "蓄力使用魔法、祷告时的伤害＋#％",
+   "en": "Increase damage of fully charged sorceries and incantations by #%",
    "suffix": [
     "fully charged power",
     "满蓄力"
@@ -10878,20 +10878,20 @@
    },
    "text": {
     "Common": {
-     "en": "Increase damage of fully charged skills or spells by 6%",
-     "zh": "蓄力使用魔法、祷告、战技时的伤害＋6％"
+     "zh": "蓄力使用魔法、祷告时的伤害＋6％",
+     "en": "Increase damage of fully charged sorceries and incantations by 6%"
     },
     "Epic": {
-     "en": "Increase damage of fully charged skills or spells by 14%",
-     "zh": "蓄力使用魔法、祷告、战技时的伤害＋14％"
+     "zh": "蓄力使用魔法、祷告时的伤害＋14％",
+     "en": "Increase damage of fully charged sorceries and incantations by 14%"
     },
     "Rare": {
-     "en": "Increase damage of fully charged skills or spells by 9%",
-     "zh": "蓄力使用魔法、祷告、战技时的伤害＋9％"
+     "zh": "蓄力使用魔法、祷告时的伤害＋9％",
+     "en": "Increase damage of fully charged sorceries and incantations by 9%"
     },
     "Legendary": {
-     "en": "Increase damage of fully charged skills or spells by 20%",
-     "zh": "蓄力使用魔法、祷告、战技时的伤害＋20％"
+     "zh": "蓄力使用魔法、祷告时的伤害＋20％",
+     "en": "Increase damage of fully charged sorceries and incantations by 20%"
     }
    },
    "tal": {
@@ -10905,7 +10905,7 @@
     "talisman": 1200
    },
    "group": "施法 / 战技",
-   "archetype": "战技",
+   "archetype": "法术",
    "weight_src": {
     "armor": 153,
     "talisman": 42
@@ -10945,12 +10945,12 @@
       "mu": 6.0,
       "sigma": 0.9375,
       "tpl": [
-       "蓄力使用魔法、祷告、战技时的伤害＋{0}％",
-       "Increase damage of fully charged skills or spells by {0}%"
+       "蓄力使用魔法、祷告时的伤害＋{0}％",
+       "Increase damage of fully charged sorceries and incantations by {0}%"
       ],
       "span": [
-       "蓄力使用魔法、祷告、战技时的伤害＋4.1~7.9％",
-       "Increase damage of fully charged skills or spells by 4.1~7.9%"
+       "蓄力使用魔法、祷告时的伤害＋4.1~7.9％",
+       "Increase damage of fully charged sorceries and incantations by 4.1~7.9%"
       ],
       "rows": [
        7003000
@@ -11006,12 +11006,12 @@
       "mu": 8.69138,
       "sigma": 1.5,
       "tpl": [
-       "蓄力使用魔法、祷告、战技时的伤害＋{0}％",
-       "Increase damage of fully charged skills or spells by {0}%"
+       "蓄力使用魔法、祷告时的伤害＋{0}％",
+       "Increase damage of fully charged sorceries and incantations by {0}%"
       ],
       "span": [
-       "蓄力使用魔法、祷告、战技时的伤害＋7~12％",
-       "Increase damage of fully charged skills or spells by 7~12%"
+       "蓄力使用魔法、祷告时的伤害＋7~12％",
+       "Increase damage of fully charged sorceries and incantations by 7~12%"
       ],
       "rows": [
        7003010
@@ -11067,12 +11067,12 @@
       "mu": 13.90222,
       "sigma": 1.84375,
       "tpl": [
-       "蓄力使用魔法、祷告、战技时的伤害＋{0}％",
-       "Increase damage of fully charged skills or spells by {0}%"
+       "蓄力使用魔法、祷告时的伤害＋{0}％",
+       "Increase damage of fully charged sorceries and incantations by {0}%"
       ],
       "span": [
-       "蓄力使用魔法、祷告、战技时的伤害＋10.8~17.7％",
-       "Increase damage of fully charged skills or spells by 10.8~17.7%"
+       "蓄力使用魔法、祷告时的伤害＋10.8~17.7％",
+       "Increase damage of fully charged sorceries and incantations by 10.8~17.7%"
       ],
       "rows": [
        7003020
@@ -11128,12 +11128,12 @@
       "mu": 20.0,
       "sigma": 1.875,
       "tpl": [
-       "蓄力使用魔法、祷告、战技时的伤害＋{0}％",
-       "Increase damage of fully charged skills or spells by {0}%"
+       "蓄力使用魔法、祷告时的伤害＋{0}％",
+       "Increase damage of fully charged sorceries and incantations by {0}%"
       ],
       "span": [
-       "蓄力使用魔法、祷告、战技时的伤害＋16.2~23.8％",
-       "Increase damage of fully charged skills or spells by 16.2~23.8%"
+       "蓄力使用魔法、祷告时的伤害＋16.2~23.8％",
+       "Increase damage of fully charged sorceries and incantations by 16.2~23.8%"
       ],
       "rows": [
        7003030

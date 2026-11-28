@@ -686,7 +686,9 @@ AFFIX_STATE_PULSE = [
      '    DR_ClashFrame("l", FALSE) -- Dark Reforged: 相杀（轻击）'),
     (r'^function (AttackBothLeft(\d|Dash|Step|Special\d)|AttackDual(Light\d|Dash|BackStep|Rolling|Stealth))_onUpdate\(\)$',
      '    DR_ClashFrame("l", TRUE, TRUE) -- Dark Reforged: 相杀（双持轻击）'),
-    (r'^function (JumpAttack_Start_Falling(_F|_D)?|Jump_LandAttack_(Normal|Hard)|Jump_Attack_Land_F)_onUpdate\(\)$',
+    # 起跳后马上按攻击（上升段，原版 SpEffect 140）：攻击叠在起跳状态 Jump_N / F / D 里播，下落切 Jump_Loop，原地跳连落地动作也在 Jump_N 里，
+    # 不进 JumpAttack_Start_Falling（用户 2026-11-27「带燃血护符进行跳跃攻击正常消耗绿条」）→ 这四个状态也挂；DR_ClashJumpFrame 只在 JumpAttackForm 1–3 时发
+    (r'^function (JumpAttack_Start_Falling(_F|_D)?|Jump_LandAttack_(Normal|Hard)|Jump_Attack_Land_F|Jump_(N|F|D|Loop))_onUpdate\(\)$',
      '    DR_ClashJumpFrame() -- Dark Reforged: 相杀（跳跃攻击）'),
     # 远程与道具：射出箭 / 弩箭（含潜行、骑马、战技的射出）、投掷道具（投掷壶、附绳壶、大投掷壶、飞刀、投矛，含攻击中快投飞刀、骑马投）、调香。
     # 射击、投掷每帧发 shot / throw，新的一次另发 shot_new / throw_new（无尽箭袋按这个扣专注；2026-10-29 以前只认弓、不认弩和快投）
