@@ -398,14 +398,22 @@ fn locked_keys() -> HashSet<(u8, u32)> {
 
 /// 弃置名单（dark_core 的 gear.rs 写的，工坊「超限」页武器栏第 4 个按钮）：这个角色的生成武器 base 编号。
 /// 键是 base（param_id / 10000 * 10000，每把生成武器独占一条参数行），所以只跟武器对得上。
-/// 这里只读不写（写名单的是 dark_core 和 dark_lock，别两边同时改）
-fn discard_keys() -> HashSet<u32> {
+/// 这里只读不写（写名单的是 dark_core 和 dark_lock，别两边同时改）。
+/// 格子和角色名都对上才算（同一格子换了角色，参数行是另一套装备，按格子认会卖错）
+fn discard_keys(pgd: &PlayerGameData) -> HashSet<u32> {
     let Some(slot) = unsafe { GameMan::instance() }.ok().map(|g| g.save_slot) else { return HashSet::new() };
-    let text = rec_text("discard_items.txt").unwrap_or_default();
+    let len = pgd.character_name.iter().position(|&c| c == 0).unwrap_or(pgd.character_name.len());
+    let name = String::from_utf16_lossy(&pgd.character_name[..len]);
+    discard_parse(&rec_text("discard_items.txt").unwrap_or_default(), slot, &name)
+}
+
+/// 名单全文里这个角色（格子 + 角色名）的 base；一行「格子<TAB>0<TAB>base<TAB>角色名」，说明行（#）、缺列的不算
+fn discard_parse(text: &str, slot: i32, name: &str) -> HashSet<u32> {
     text.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.trim_end_matches('\r').split('\t').collect();
-            (f.len() >= 3 && f[0].parse::<i32>().ok() == Some(slot)).then(|| f[2].parse::<u32>().ok()).flatten()
+            let ours = f.len() >= 4 && f[0].trim_start_matches('\u{feff}').parse::<i32>().ok() == Some(slot) && f[3] == name;
+            ours.then(|| f[2].parse::<u32>().ok()).flatten()
         })
         .collect()
 }
@@ -546,10 +554,10 @@ fn sell_discarded() -> Option<(u32, u32)> {
     let inv_ptr = place_inv(pgd, 0)?;
     let inv = unsafe { &mut *inv_ptr };
     let key_cap = inv.items_data.key_items_capacity;
-    let disc = discard_keys();
+    let disc = discard_keys(pgd);
     let picks: Vec<(usize, u32, u32, u32)> = sellable(pgd, inv, false, &locked_keys())
         .into_iter()
-        .filter(|p| disc.contains(&pid_base(p.raw)))
+        .filter(|p| p.cat == 0 && disc.contains(&pid_base(p.raw))) // 名单只记武器，防具、护符的编号别碰巧对上
         .map(|p| (p.idx, p.raw, p.qty, p.price))
         .collect();
     let remove = unsafe { std::mem::transmute::<usize, RemoveItemFn>(f) };
@@ -652,9 +660,9 @@ fn write_fields() {
         let mut acc = (0u32, 0u32);
         if let Some(inv_ptr) = place_inv(pgd, 0) {
             let inv = unsafe { &*inv_ptr };
-            let disc = discard_keys();
+            let disc = discard_keys(pgd);
             for p in sellable(pgd, inv, false, &locked) {
-                if disc.contains(&pid_base(p.raw)) {
+                if p.cat == 0 && disc.contains(&pid_base(p.raw)) {
                     acc.0 += p.qty;
                     acc.1 = acc.1.saturating_add(p.price.saturating_mul(p.qty));
                 }
@@ -1125,6 +1133,14 @@ mod tests {
         assert_eq!(t[0], [(1, 100), (1, 100), (3, 200), (3, 200)]);
         assert_eq!(t[1], [(0, 0); TIERS]);
         assert_eq!(t[2], [(0, 0), (0, 0), (0, 0), (1, 1000)]);
+    }
+
+    #[test]
+    fn discard_list_matches_slot_and_name() {
+        let t = "# 格子\t类别\t编号\t角色名\r\n0\t0\t1230000\t褪色者\r\n0\t0\t1240000\t别人\n1\t0\t1250000\t褪色者\n0\t0\t1260000\n";
+        assert_eq!(discard_parse(t, 0, "褪色者"), HashSet::from([1230000]), "同格子别的角色名、别的格子、缺角色名的都不算");
+        assert_eq!(discard_parse(t, 0, "别人"), HashSet::from([1240000]));
+        assert!(discard_parse("", 0, "褪色者").is_empty());
     }
 
     #[test]

@@ -31,8 +31,8 @@ NAMES = {'zh': {'menu': '暗黑商店', 'melee': '近战武器商店', 'ranged':
 RECYCLE_TEXT, R_TIER_TEXT, R_DESC_TEXT, R_DONE_TEXT, R_MISSING_TEXT = 80090200, 80090201, 80090205, 80090209, 80090210
 R_KIND0 = 3
 # 「回收全部弃置」（用户 2026-11-26）：档位名、确认框（80090220 段空着；不能接在 R_DESC_TEXT 后面，那个会撞 R_DONE_TEXT）
-# 确认框占位序号 17（#IH）：dark_core 的 confirm_tick 第 17 项
-R_DISCARD_TEXT, R_DISCARD_DESC, R_DISCARD_KIND = 80090220, 80090221, 17
+# 确认框占位序号 18（#II）：dark_core 的 confirm_tick 第 18 项（17 #IH 是许愿石的结果文字，20~26 是斗技场的，别撞）
+R_DISCARD_TEXT, R_DISCARD_DESC, R_DISCARD_KIND = 80090220, 80090221, 18
 FIELD_LEN = {'zh': 30, 'en': 44}                   # 含两端括号的字符数（和一键鉴定一样）
 
 

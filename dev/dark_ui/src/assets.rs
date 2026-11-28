@@ -96,7 +96,7 @@ impl Assets {
     }
 
     /// 原版素材（解出来裁成精灵本身的大小）；DR_Lock = 锁定图标（和 dark_lock 在背包格子里画的同一张），
-    /// DR_Discard = 「弃置」的红叉（用户 2026-11-26 画的，42×42）
+    /// DR_Discard = 「弃置」的红叉（用户 2026-11-26 画的，40×42）
     pub fn sprite(&self, name: &str) -> Option<Rgba> {
         if name == "DR_Lock" {
             return lock_icon();
@@ -146,7 +146,7 @@ fn lock_icon() -> Option<Rgba> {
     swf_bitmap(LOCK)
 }
 
-/// 「弃置」的红叉（dev\dark_ui\src\discard_bitmap.bin：42×42，用户 2026-11-26 自己画的；容器格式和锁图一样）
+/// 「弃置」的红叉（dev\dark_ui\src\discard_bitmap.bin：40×42，用户 2026-11-26 自己画的；容器格式和锁图一样）
 fn discard_icon() -> Option<Rgba> {
     const ICON: &[u8] = include_bytes!("discard_bitmap.bin");
     swf_bitmap(ICON)

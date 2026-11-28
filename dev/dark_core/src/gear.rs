@@ -3206,9 +3206,15 @@ pub(super) fn rec_aside_copy(path: &std::path::Path) -> Option<PathBuf> {
     fs::create_dir_all(&dir).and_then(|_| fs::copy(path, &dst)).ok().map(|_| dst)
 }
 
-/// 刚建的角色：这个格子以前的锁定（锁定名单只按格子记）清掉。dark_lock 自己内存里的那份经 dr_who_fresh 知道、也会清
+/// 刚建的角色：这个格子以前的锁定（锁定名单只按格子记）清掉。dark_lock 自己内存里的那份经 dr_who_fresh 知道、也会清。
+/// 弃置名单同样清（discard_items.txt，dark_lock 每次现读，不用另外通知）
 fn lock_clear_slot(slot: i32) {
-    let p = data_dir().join(LOCK_FILE);
+    list_clear_slot(LOCK_FILE, "锁定名单", "锁定", slot);
+    list_clear_slot(DISCARD_FILE, "弃置名单", "弃置", slot);
+}
+
+fn list_clear_slot(file: &str, list: &str, what: &str, slot: i32) {
+    let p = data_dir().join(file);
     let Ok(text) = fs::read_to_string(&p) else { return };
     let mut gone = 0;
     let keep: Vec<&str> = text
@@ -3223,7 +3229,7 @@ fn lock_clear_slot(slot: i32) {
         return;
     }
     let ok = fs::write(&p, keep.join("\n") + "\n").is_ok();
-    log(&format!("锁定名单：格子 {slot} 是刚建的角色，清掉这个格子以前的 {gone} 条锁定{}", if ok { "" } else { "（写不进去）" }));
+    log(&format!("{list}：格子 {slot} 是刚建的角色，清掉这个格子以前的 {gone} 条{what}{}", if ok { "" } else { "（写不进去）" }));
 }
 
 /// path 里不是 name 的记录：到 旧记录 里找同一个文件名开头（同一格子）、角色名是 name 的，最新的一份 → (路径, 内容)
@@ -3420,6 +3426,9 @@ fn unidentified(d: &Defs, pgd: &PlayerGameData) -> Vec<(u32, u32)> {
 /// 这个角色锁定名单里有的不用（dark_lock 只在内存里管名单，这里不去改它的文件，免得旧的锁定跟到新装备上）
 fn free(d: &Defs, st: &St, held: &HashSet<(usize, u32)>) -> [Vec<u32>; NCAT] {
     let locked = st.who.as_ref().map(|w| locked_keys(&rec_read(LOCK_FILE).unwrap_or_default(), w)).unwrap_or_default();
+    // 弃置名单里有的武器格子也不用：卖掉 / 丢掉以后条目要等修剪才删，这之前格子分给新鉴定的武器，新武器就带着弃置标记，
+    // 下次「出售全部弃置」「回收全部弃置」会把它一起处理掉（PR #3 审查）
+    let disc = st.who.as_ref().map(|w| discard_keys(&discard_text(), w)).unwrap_or_default();
     let sold: HashSet<(usize, u32)> = st.sold.iter().flatten().map(|r| (r.cat, r.idx)).collect();
     let shop: HashSet<(usize, u32)> = st.shop.iter().flatten().chain(&st.shop_prev).map(|r| (r.cat, r.idx)).collect();
     let mut out: [Vec<u32>; NCAT] = Default::default();
@@ -3433,6 +3442,7 @@ fn free(d: &Defs, st: &St, held: &HashSet<(usize, u32)>) -> [Vec<u32>; NCAT] {
                     && !sold.contains(&(c, *k))
                     && !shop.contains(&(c, *k))
                     && !locked.contains(&(c, ct.id(*k)))
+                    && !(c == 0 && disc.contains(&ct.id(*k)))
             })
             .collect();
     }
@@ -3457,6 +3467,8 @@ fn locked_keys(text: &str, who: &(i32, String)) -> HashSet<(usize, u32)> {
 /// 弃置名单：和锁定名单同目录同格式，一行「格子<TAB>0<TAB>编号<TAB>角色名」，只给生成武器用。
 /// 编号是 base（param_id / 10000 * 10000）：每把生成武器独占一条参数行，所以精确到单把，强化后也不变
 /// （强化等级是 pid - base，+1 步进）。锁定名单那边按「去掉末两位」记，对生成武器算出来同样是 base，这里直接用 base 更明确。
+/// 格子和角色名都对上才算这个角色的（同一格子换了角色，参数行是另一套装备）；刚建的角色清掉这个格子以前的条目（start_fresh）。
+/// 名单里的武器格子不分给新装备（free），条目在修剪（工坊快照、鉴定前）时才删。
 /// 写入：dark_core（工坊的弃置按钮、回收后删、修剪）、dark_lock（在背包里锁定时删一条）；
 /// 读取：dark_core（快照、回收）、dark_sell（出售）。dark_sell 只读不写，避免两个 DLL 同时写同一份文件。
 const DISCARD_FILE: &str = "discard_items.txt";
@@ -3466,12 +3478,17 @@ fn discard_text() -> String {
     fs::read_to_string(data_dir().join(DISCARD_FILE)).unwrap_or_default()
 }
 
+/// 名单的一行（已按 TAB 切开）是不是这个角色的：格子、角色名都对上
+fn discard_ours(f: &[&str], who: &(i32, String)) -> bool {
+    f.len() >= 4 && f[0].trim_start_matches('\u{feff}').parse::<i32>().ok() == Some(who.0) && f[3] == who.1
+}
+
 /// 名单里这个角色的 base 编号
 fn discard_keys(text: &str, who: &(i32, String)) -> HashSet<u32> {
     text.lines()
         .filter_map(|l| {
             let f: Vec<&str> = l.trim_end_matches('\r').split('\t').collect();
-            (f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0)).then(|| f[2].parse::<u32>().ok()).flatten()
+            discard_ours(&f, who).then(|| f[2].parse::<u32>().ok()).flatten()
         })
         .collect()
 }
@@ -3501,7 +3518,7 @@ fn discard_toggle(who: &(i32, String), base: u32) -> bool {
             continue;
         }
         let f: Vec<&str> = l.split('\t').collect();
-        if f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0) && f[2].parse::<u32>().ok() == Some(base) {
+        if discard_ours(&f, who) && f[2].parse::<u32>().ok() == Some(base) {
             had = true;
             continue;
         }
@@ -3525,8 +3542,7 @@ fn discard_remove(who: &(i32, String), bases: &[u32]) {
             continue;
         }
         let f: Vec<&str> = l.split('\t').collect();
-        let ours = f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0);
-        if ours && f[2].parse::<u32>().ok().is_some_and(|b| bases.contains(&b)) {
+        if discard_ours(&f, who) && f[2].parse::<u32>().ok().is_some_and(|b| bases.contains(&b)) {
             hit += 1;
             continue;
         }
@@ -3565,8 +3581,7 @@ fn discard_prune(pgd: &PlayerGameData, who: &(i32, String)) -> usize {
             continue;
         }
         let f: Vec<&str> = l.split('\t').collect();
-        let ours = f.len() >= 3 && f[0].parse::<i32>().ok() == Some(who.0);
-        if ours && f[2].parse::<u32>().ok().is_some_and(|b| !live.contains(&b)) {
+        if discard_ours(&f, who) && f[2].parse::<u32>().ok().is_some_and(|b| !live.contains(&b)) {
             gone += 1;
             continue;
         }
@@ -4544,8 +4559,9 @@ fn confirm_tick(d: &Defs, st: &St, pgd: &PlayerGameData) {
     for i in 0..gift::MAX_PEERS {
         tx.push(gift::label(i));
     }
-    // 17（占位写 #IH）：回收全部弃置（「超限」页武器栏打了弃置标记的那些，用户 2026-11-26）
-    tx.resize(17, None);
+    // 17（#IH）是许愿石用掉几个的结果（wishstone.rs 的 RESULT_KIND，不经这里），20~26（#IK~#IQ）是斗技场的（arena.rs）
+    // 18（占位写 #II）：回收全部弃置（「超限」页武器栏打了弃置标记的那些，用户 2026-11-26）
+    tx.resize(18, None);
     if let Some(rc) = d.items.recycle.filter(|r| r.discard != 0) {
         let (k, s) = recycle_discard_counts(d, st, pgd, &rc);
         tx.push(Some(if k == 0 {
@@ -6052,6 +6068,17 @@ mod tests {
         let t = "# 注释\n2\t0\t240010000\t褪色者\n2\t1\t30000500\t褪色者\n3\t0\t240020000\t褪色者\n2\t2\t20001\t别人\n";
         let k = locked_keys(t, &(2, "褪色者".into()));
         assert_eq!(k, HashSet::from([(0, 240010000), (1, 30000500)]));
+    }
+
+    #[test]
+    fn discard_keys_need_slot_and_name() {
+        // 同一格子换了角色（参数行是另一套装备）的、别的格子的、缺角色名的都不算这个角色的
+        let t = "# 格子\t类别\t编号\t角色名\r\n2\t0\t240010000\t褪色者\r\n2\t0\t240020000\t别人\n3\t0\t240030000\t褪色者\n2\t0\t240040000\n";
+        let me = (2, "褪色者".to_string());
+        assert_eq!(discard_keys(t, &me), HashSet::from([240010000]));
+        assert_eq!(discard_keys(t, &(2, "别人".into())), HashSet::from([240020000]));
+        assert!(discard_ours(&["\u{feff}2", "0", "1", "褪色者"], &me), "文件开头带 BOM 也认");
+        assert!(!discard_ours(&["2", "0", "1"], &me));
     }
 
     #[test]

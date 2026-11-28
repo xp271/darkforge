@@ -157,6 +157,13 @@ fn make_gear(lib: &Lib, w: &Want, rng: &mut Rng) -> Option<Recipe> {
 pub(super) fn run(d: &Defs, st: &St, pgd: &PlayerGameData, src: Src, wants: impl IntoIterator<Item = Want>, budget: u32,
                   mut price: impl FnMut(&Want) -> u32) -> Batch {
     let held = held(d, pgd);
+    // 弃置名单里卖掉 / 丢掉的武器条目先修剪掉，那些格子才能用（free 不用名单里的格子）
+    if let Some(who) = st.who.as_ref() {
+        let pruned = discard_prune(pgd, who);
+        if pruned > 0 {
+            log(&format!("弃置名单：清掉 {pruned} 条（背包和木箱里都没有了）"));
+        }
+    }
     let mut free = free(d, st, &held);
     let mut rng = Rng::new();
     let mut b = Batch::default();

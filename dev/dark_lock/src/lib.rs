@@ -380,10 +380,10 @@ fn save_locked(map: &HashMap<Key, String>) {
     }
 }
 
-/// 把这个格子的这把武器从弃置名单删掉（锁定即取消弃置，用户 2026-11-26），返回删了没有。
+/// 把这个角色（格子 + 角色名）的这把武器从弃置名单删掉（锁定即取消弃置，用户 2026-11-26），返回删了没有。
 /// 弃置名单是 dark_core 的（装备工坊「超限」页武器栏第 4 个按钮写的），和 lock_items.txt 同一个目录
 /// （联机时 角色记录\联机\）。两边都在游戏线程里跑，而且每次都现读现改、不缓存，不会真并发
-fn drop_discard(slot: i32, base: u32) -> bool {
+fn drop_discard(slot: i32, name: &str, base: u32) -> bool {
     let p = lock_file().with_file_name("discard_items.txt");
     let Ok(text) = fs::read_to_string(&p) else { return false };
     let mut out = String::from("# 格子\t类别（0 武器）\t编号（生成武器的 base = 参数行 id / 10000 * 10000）\t角色名\n");
@@ -392,8 +392,7 @@ fn drop_discard(slot: i32, base: u32) -> bool {
         if l.trim().is_empty() || l.starts_with('#') {
             continue;
         }
-        let f: Vec<&str> = l.split('\t').collect();
-        if f.len() >= 3 && f[0].parse::<i32>().ok() == Some(slot) && f[2].parse::<u32>().ok() == Some(base) {
+        if discard_line(l) == Some((slot, base, name)) {
             hit = true;
             continue;
         }
@@ -608,7 +607,7 @@ unsafe extern "C" fn fn_call(this: *const LockFn, ret: *mut usize, arg: usize) -
         });
         log(&format!("{}：格子 {} 类别 {} 编号 {}（物品编号 {id:08x}，{name}，参数 {arg:#x}）", if now { "锁定" } else { "解锁" }, key.0, key.1, key.2));
         // 用户 2026-11-26：刚锁定的武器如果标了弃置，顺手把弃置取消（锁定 = 保护、弃置 = 待处理，两者不能同时成立）
-        if now && key.1 == 0 && drop_discard(key.0, key.2) {
+        if now && key.1 == 0 && drop_discard(key.0, &name, key.2) {
             log(&format!("锁定：格子 {} 编号 {} 同时取消了弃置", key.0, key.2));
         }
     }
@@ -818,31 +817,40 @@ fn is_locked(handle: u32) -> bool {
     item_id(handle).is_some_and(|id| with_locked(|m| m.contains_key(&(slot, cat, key_id(cat, id)))))
 }
 
-/// 弃置名单（角色记录[\联机]\discard_items.txt）：(存档格子, base) 的集合。
-/// 这个文件由 dark_core 写，这里只读；格子刷新每帧都在问，所以缓存 500 毫秒再重读一次（玩家点完弃置最多半秒就看到红叉）
-static DISCARDED: Mutex<Option<(std::time::Instant, std::collections::HashSet<(i32, u32)>)>> = Mutex::new(None);
+/// 弃置名单（角色记录[\联机]\discard_items.txt）里当前角色（格子 + 角色名）的 base 集合。
+/// 这个文件由 dark_core 写，这里只读；格子刷新每帧都在问，所以缓存 500 毫秒再重读一次（玩家点完弃置最多半秒就看到红叉），
+/// 换了角色也重读。格子和角色名都对上才算：同一格子换了角色，参数行是另一套装备
+type Who = (i32, String);
+static DISCARDED: Mutex<Option<(std::time::Instant, Who, std::collections::HashSet<u32>)>> = Mutex::new(None);
 
 fn discard_file() -> PathBuf {
     lock_file().with_file_name("discard_items.txt")
 }
 
-fn with_discarded<R>(f: impl FnOnce(&std::collections::HashSet<(i32, u32)>) -> R) -> R {
+/// 名单的一行 → (格子, base, 角色名)；说明行、空行、缺列的是 None
+fn discard_line(l: &str) -> Option<(i32, u32, &str)> {
+    if l.trim().is_empty() || l.starts_with('#') {
+        return None;
+    }
+    let f: Vec<&str> = l.split('\t').collect();
+    Some((f.first()?.trim_start_matches('\u{feff}').parse().ok()?, f.get(2)?.parse().ok()?, *f.get(3)?))
+}
+
+fn with_discarded<R>(who: &Who, f: impl FnOnce(&std::collections::HashSet<u32>) -> R) -> R {
     let mut g = DISCARDED.lock().unwrap_or_else(|e| e.into_inner());
-    let stale = g.as_ref().map_or(true, |(t, _)| t.elapsed().as_millis() >= 500);
+    let stale = g.as_ref().map_or(true, |(t, w, _)| t.elapsed().as_millis() >= 500 || w != who);
     if stale {
         let text = fs::read_to_string(discard_file()).unwrap_or_default();
         let set = text
             .lines()
             .map(|l| l.trim_end_matches('\r'))
-            .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
-            .filter_map(|l| {
-                let f: Vec<&str> = l.split('\t').collect();
-                Some((f.first()?.parse::<i32>().ok()?, f.get(2)?.parse::<u32>().ok()?))
-            })
+            .filter_map(discard_line)
+            .filter(|&(s, _, n)| s == who.0 && n == who.1)
+            .map(|x| x.1)
             .collect();
-        *g = Some((std::time::Instant::now(), set));
+        *g = Some((std::time::Instant::now(), who.clone(), set));
     }
-    f(&g.as_ref().unwrap().1)
+    f(&g.as_ref().unwrap().2)
 }
 
 /// 生成武器的 base：参数行 id / 10000 * 10000（每把独占一行，强化前后不变）
@@ -852,20 +860,21 @@ fn discard_base(id: u32) -> u32 {
 
 /// 格子上的物品弃置了没有（只武器）
 fn is_discarded(handle: u32) -> bool {
-    let (Some(cat), Some((slot, _))) = (cat_of(handle), character()) else { return false };
+    let (Some(cat), Some(who)) = (cat_of(handle), character()) else { return false };
     if cat != 0 {
         return false;
     }
     let Some(id) = item_id(handle) else { return false };
     let base = discard_base(id);
-    let hit = with_discarded(|m| m.contains(&(slot, base)));
+    let slot = who.0;
+    let hit = with_discarded(&who, |m| m.contains(&base));
     if hit {
         // 命中时记一行，方便反馈"红叉没出现"时区分「没命中」和「命中了没画出来」；格子刷新很频繁，最多 5 秒一行
         static AT: Mutex<Option<std::time::Instant>> = Mutex::new(None);
         let mut g = AT.lock().unwrap_or_else(|e| e.into_inner());
         if g.map_or(true, |t| t.elapsed().as_secs() >= 5) {
             *g = Some(std::time::Instant::now());
-            log(&format!("弃置红叉：格子 {slot} 的 {base} 该显示（名单 {} 条）", with_discarded(|m| m.len())));
+            log(&format!("弃置红叉：格子 {slot} 的 {base} 该显示（这个角色名单里 {} 条）", with_discarded(&who, |m| m.len())));
         }
     }
     hit
@@ -874,6 +883,15 @@ fn is_discarded(handle: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn discard_lines() {
+        assert_eq!(discard_line("2\t0\t240010000\t褪色者"), Some((2, 240010000, "褪色者")));
+        assert_eq!(discard_line("\u{feff}2\t0\t240010000\t褪色者"), Some((2, 240010000, "褪色者")), "文件开头的 BOM");
+        assert_eq!(discard_line("2\t0\t240010000"), None, "缺角色名的不认");
+        assert_eq!(discard_line("# 格子\t类别\t编号\t角色名"), None);
+        assert_eq!(discard_line("  "), None);
+    }
 
     #[test]
     fn parse_old_and_new() {
